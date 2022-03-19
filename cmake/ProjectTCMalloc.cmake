@@ -12,7 +12,7 @@ set(TCMALLOC_CONFIG ./configure CXXFLAGS=-DHAVE_POSIX_MEMALIGN_SYMBOL=1 --enable
 set(TCMALLOC_MAKE make install)
 
 ExternalProject_Add(gperftools
-    PREFIX ${CMAKE_SOURCE_DIR}/deps/
+    PREFIX ${CMAKE_CURRENT_SOURCE_DIR}/deps/
     DOWNLOAD_NAME gperftools-2.7.tar.gz
     DOWNLOAD_NO_PROGRESS 1
     URL https://github.com/gperftools/gperftools/releases/download/gperftools-2.7/gperftools-2.7.tar.gz
@@ -39,4 +39,5 @@ file(MAKE_DIRECTORY ${TCMALLOC_INCLUDE_DIR})  # Must exist.
 set_property(TARGET TCMalloc PROPERTY IMPORTED_LOCATION ${TCMALLOC_LIBRARY})
 set_property(TARGET TCMalloc PROPERTY INTERFACE_INCLUDE_DIRECTORIES ${TCMALLOC_INCLUDE_DIR})
 
+add_dependencies(TCMalloc gperftools)
 unset(SOURCE_DIR)
