@@ -17,8 +17,11 @@ using namespace bcos;
 using namespace bcos::gateway;
 
 P2PSession::P2PSession()
+  : m_p2pInfo(std::make_shared<P2PInfo>()),
+    m_protocolInfo(std::make_shared<bcos::protocol::ProtocolInfo>())
 {
-    m_p2pInfo = std::make_shared<P2PInfo>();
+    // init with the minVersion
+    m_protocolInfo->setVersion(m_protocolInfo->minVersion());
     P2PSESSION_LOG(INFO) << "[P2PSession::P2PSession] this=" << this;
 }
 
@@ -43,7 +46,7 @@ void P2PSession::stop(DisconnectReason reason)
     if (m_run)
     {
         m_run = false;
-        if (m_session && m_session->actived())
+        if (m_session && m_session->active())
         {
             m_session->disconnect(reason);
         }
@@ -53,22 +56,20 @@ void P2PSession::stop(DisconnectReason reason)
 void P2PSession::heartBeat()
 {
     auto service = m_service.lock();
-    if (service && service->actived())
+    if (service && service->active())
     {
-        if (m_session && m_session->actived())
+        if (m_session && m_session->active())
         {
             auto message =
                 std::dynamic_pointer_cast<P2PMessage>(service->messageFactory()->buildMessage());
-            message->setPacketType(MessageType::Heartbeat);
-            uint32_t statusSeq =
-                boost::asio::detail::socket_ops::host_to_network_long(service->statusSeq());
-            auto payload = std::make_shared<bytes>((byte*)&statusSeq, (byte*)&statusSeq + 4);
-            message->setPayload(payload);
-
-            P2PSESSION_LOG(DEBUG) << LOG_DESC("P2PSession onHeartBeat")
-                                  << LOG_KV("p2pid", m_p2pInfo->p2pID)
-                                  << LOG_KV("endpoint", m_session->nodeIPEndpoint())
-                                  << LOG_KV("statusSeq", service->statusSeq());
+            message->setPacketType(GatewayMessageType::Heartbeat);
+            if (c_fileLogLevel <= TRACE) [[unlikely]]
+            {
+                P2PSESSION_LOG(TRACE)
+                    << LOG_DESC("P2PSession onHeartBeat")
+                    << LOG_KV("p2pid", P2PMessage::printP2PIDElegantly(m_p2pInfo->p2pID))
+                    << LOG_KV("endpoint", m_session->nodeIPEndpoint());
+            }
 
             m_session->asyncSendMessage(message);
         }

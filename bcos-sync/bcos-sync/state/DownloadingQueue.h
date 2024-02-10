@@ -21,11 +21,10 @@
 #pragma once
 #include "bcos-sync/BlockSyncConfig.h"
 #include "bcos-sync/interfaces/BlocksMsgInterface.h"
-#include <bcos-framework/interfaces/protocol/Block.h>
+#include <bcos-framework/protocol/Block.h>
+#include <bcos-tool/LedgerConfigFetcher.h>
 #include <queue>
-namespace bcos
-{
-namespace sync
+namespace bcos::sync
 {
 // increase order
 struct BlockCmp
@@ -47,9 +46,11 @@ public:
 
     using Ptr = std::shared_ptr<DownloadingQueue>;
     explicit DownloadingQueue(BlockSyncConfig::Ptr _config)
-      : m_config(_config), m_blockBuffer(std::make_shared<BlocksMessageQueue>())
-    {}
-    virtual ~DownloadingQueue() {}
+      : m_config(std::move(_config)), m_blockBuffer(std::make_shared<BlocksMessageQueue>())
+    {
+        m_ledgerFetcher = std::make_shared<bcos::tool::LedgerConfigFetcher>(m_config->ledger());
+    }
+    virtual ~DownloadingQueue() = default;
 
     virtual void push(BlocksMsgInterface::Ptr _blocksData);
     // Is the queue empty?
@@ -73,7 +74,12 @@ public:
     virtual void registerNewBlockHandler(
         std::function<void(bcos::ledger::LedgerConfig::Ptr)> _newBlockHandler)
     {
-        m_newBlockHandler = _newBlockHandler;
+        m_newBlockHandler = std::move(_newBlockHandler);
+    }
+
+    void registerApplyFinishedHandler(std::function<void(bool)> _applyFinishedHandler)
+    {
+        m_applyFinishedHandler = std::move(_applyFinishedHandler);
     }
 
     // flush m_buffer into queue
@@ -82,16 +88,17 @@ public:
     virtual void tryToCommitBlockToLedger();
     virtual size_t commitQueueSize()
     {
-        ReadGuard l(x_commitQueue);
+        ReadGuard lock(x_commitQueue);
         return m_commitQueue.size();
     }
+
+    virtual void onCommitFailed(bcos::Error::Ptr _error, bcos::protocol::Block::Ptr _failedBlock);
 
 protected:
     // clear queue
     virtual void clearQueue();
     virtual void clearExpiredCache(BlockQueue& _queue, SharedMutex& _lock);
     virtual bool flushOneShard(BlocksMsgInterface::Ptr _blocksData);
-    virtual bool isNewerBlock(bcos::protocol::Block::Ptr _block);
 
     virtual void commitBlock(bcos::protocol::Block::Ptr _block);
     virtual void commitBlockState(bcos::protocol::Block::Ptr _block);
@@ -101,14 +108,14 @@ protected:
 
     virtual void finalizeBlock(
         bcos::protocol::Block::Ptr _block, bcos::ledger::LedgerConfig::Ptr _ledgerConfig);
-    virtual bool verifyExecutedBlock(
-        bcos::protocol::Block::Ptr _block, bcos::protocol::BlockHeader::Ptr _blockHeader);
+    virtual bool verifyExecutedBlock(bcos::protocol::Block::Ptr const& _block,
+        bcos::protocol::BlockHeader::Ptr const& _blockHeader) const noexcept;
 
 private:
     // Note: this function should not be called frequently
-    std::string printBlockHeader(bcos::protocol::BlockHeader::Ptr _header);
+    std::string printBlockHeader(bcos::protocol::BlockHeader::Ptr const& _header) const noexcept;
+    void fetchAndUpdateLedgerConfig();
 
-private:
     BlockSyncConfig::Ptr m_config;
     BlockQueue m_blocks;
     mutable SharedMutex x_blocks;
@@ -120,6 +127,8 @@ private:
     mutable SharedMutex x_commitQueue;
 
     std::function<void(bcos::ledger::LedgerConfig::Ptr)> m_newBlockHandler;
+    std::function<void(bool)> m_applyFinishedHandler;
+
+    std::shared_ptr<bcos::tool::LedgerConfigFetcher> m_ledgerFetcher;
 };
-}  // namespace sync
-}  // namespace bcos
+}  // namespace bcos::sync

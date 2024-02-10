@@ -19,9 +19,18 @@
  */
 #include "Sealer.h"
 #include "Common.h"
+#include "VRFBasedSealer.h"
+#include <bcos-framework/protocol/GlobalConfig.h>
+
+#include <utility>
+
 using namespace bcos;
 using namespace bcos::sealer;
 using namespace bcos::protocol;
+namespace bcos::sealer
+{
+class VRFBasedSealer;
+}
 
 void Sealer::start()
 {
@@ -56,11 +65,11 @@ void Sealer::stop()
 
 void Sealer::init(bcos::consensus::ConsensusInterface::Ptr _consensus)
 {
-    m_sealerConfig->setConsensusInterface(_consensus);
+    m_sealerConfig->setConsensusInterface(std::move(_consensus));
 }
 
-void Sealer::asyncNotifySealProposal(size_t _proposalStartIndex, size_t _proposalEndIndex,
-    size_t _maxTxsPerBlock, std::function<void(Error::Ptr)> _onRecvResponse)
+void Sealer::asyncNotifySealProposal(uint64_t _proposalStartIndex, uint64_t _proposalEndIndex,
+    uint64_t _maxTxsPerBlock, std::function<void(Error::Ptr)> _onRecvResponse)
 {
     m_sealingManager->resetSealingInfo(_proposalStartIndex, _proposalEndIndex, _maxTxsPerBlock);
     if (_onRecvResponse)
@@ -75,12 +84,18 @@ void Sealer::asyncNotifySealProposal(size_t _proposalStartIndex, size_t _proposa
 
 void Sealer::asyncNoteLatestBlockNumber(int64_t _blockNumber)
 {
-    m_sealingManager->resetCurrentNumber(_blockNumber);
+    m_sealingManager->resetLatestNumber(_blockNumber);
     SEAL_LOG(INFO) << LOG_DESC("asyncNoteLatestBlockNumber") << LOG_KV("number", _blockNumber);
 }
 
+void Sealer::asyncNoteLatestBlockHash(crypto::HashType _hash)
+{
+    SEAL_LOG(INFO) << LOG_DESC("asyncNoteLatestBlockHash") << LOG_KV("_hash", _hash.abridged());
+    m_sealingManager->resetLatestHash(std::move(_hash));
+}
+
 void Sealer::asyncNoteUnSealedTxsSize(
-    size_t _unsealedTxsSize, std::function<void(Error::Ptr)> _onRecvResponse)
+    uint64_t _unsealedTxsSize, std::function<void(Error::Ptr)> _onRecvResponse)
 {
     m_sealingManager->setUnsealedTxsSize(_unsealedTxsSize);
     if (_onRecvResponse)
@@ -100,7 +115,10 @@ void Sealer::executeWorker()
     // try to generateProposal
     if (m_sealingManager->shouldGenerateProposal())
     {
-        auto ret = m_sealingManager->generateProposal();
+        auto ret = m_sealingManager->generateProposal(
+            [this](bcos::protocol::Block::Ptr _block) -> uint16_t {
+                return hookWhenSealBlock(std::move(_block));
+            });
         auto proposal = ret.second;
         submitProposal(ret.first, proposal);
     }
@@ -113,8 +131,16 @@ void Sealer::executeWorker()
 
 void Sealer::submitProposal(bool _containSysTxs, bcos::protocol::Block::Ptr _block)
 {
-    if (_block->blockHeader()->number() <= m_sealingManager->currentNumber())
+    // Note: the block maybe empty
+    if (!_block)
     {
+        return;
+    }
+    if (_block->blockHeader()->number() <= m_sealingManager->latestNumber())
+    {
+        SEAL_LOG(INFO) << LOG_DESC("submitProposal return for the block has already been committed")
+                       << LOG_KV("proposalIndex", _block->blockHeader()->number())
+                       << LOG_KV("currentNumber", m_sealingManager->latestNumber());
         m_sealingManager->notifyResetProposal(_block);
         return;
     }
@@ -130,17 +156,23 @@ void Sealer::submitProposal(bool _containSysTxs, bcos::protocol::Block::Ptr _blo
     _block->blockHeader()->setSealerList(std::move(sealerList));
     _block->blockHeader()->setConsensusWeights(std::move(weightList));
     _block->blockHeader()->setSealer(m_sealerConfig->consensus()->nodeIndex());
+    // set the version
+    auto version = std::min(m_sealerConfig->consensus()->compatibilityVersion(),
+        (uint32_t)g_BCOSConfig.maxSupportedVersion());
+    _block->blockHeader()->setVersion(version);
+    _block->blockHeader()->calculateHash(*m_hashImpl);
+
     auto encodedData = std::make_shared<bytes>();
     _block->encode(*encodedData);
     SEAL_LOG(INFO) << LOG_DESC("++++++++++++++++ Generate proposal")
                    << LOG_KV("index", _block->blockHeader()->number())
-                   << LOG_KV("curNum", m_sealingManager->currentNumber())
+                   << LOG_KV("curNum", m_sealingManager->latestNumber())
                    << LOG_KV("hash", _block->blockHeader()->hash().abridged())
                    << LOG_KV("sysTxs", _containSysTxs)
-                   << LOG_KV("txsSize", _block->transactionsHashSize());
+                   << LOG_KV("txsSize", _block->transactionsHashSize())
+                   << LOG_KV("version", version);
     m_sealerConfig->consensus()->asyncSubmitProposal(_containSysTxs, ref(*encodedData),
-        _block->blockHeader()->number(), _block->blockHeader()->hash(),
-        [_block](Error::Ptr _error) {
+        _block->blockHeader()->number(), _block->blockHeader()->hash(), [_block](auto&& _error) {
             if (_error == nullptr)
             {
                 return;
@@ -157,4 +189,15 @@ void Sealer::asyncResetSealing(std::function<void(Error::Ptr)> _onRecvResponse)
     {
         _onRecvResponse(nullptr);
     }
+}
+
+uint16_t Sealer::hookWhenSealBlock(bcos::protocol::Block::Ptr _block)
+{
+    if (!m_sealerConfig->consensus()->shouldRotateSealers(
+            _block == nullptr ? -1 : _block->blockHeader()->number()))
+    {
+        return SealBlockResult::SUCCESS;
+    }
+    return VRFBasedSealer::generateTransactionForRotating(
+        _block, m_sealerConfig, m_sealingManager, m_hashImpl);
 }

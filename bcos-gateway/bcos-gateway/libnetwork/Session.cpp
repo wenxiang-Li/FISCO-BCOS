@@ -7,6 +7,9 @@
  * @date 2018
  */
 
+#include "bcos-gateway/libnetwork/Message.h"
+#include "bcos-utilities/BoostLog.h"
+#include "bcos-utilities/CompositeBuffer.h"
 #include <bcos-gateway/libnetwork/ASIOInterface.h>  // for ASIOIn...
 #include <bcos-gateway/libnetwork/Common.h>         // for SESSIO...
 #include <bcos-gateway/libnetwork/Host.h>           // for Host
@@ -14,18 +17,27 @@
 #include <bcos-gateway/libnetwork/SessionFace.h>  // for Respon...
 #include <bcos-gateway/libnetwork/SocketFace.h>   // for Socket...
 #include <chrono>
+#include <cstddef>
+#include <fstream>
+#include <iterator>
+#include <utility>
 
 using namespace bcos;
 using namespace bcos::gateway;
 
-Session::Session(size_t _bufferSize) : bufferSize(_bufferSize)
+
+Session::Session(size_t _recvBufferSize, bool _forceSize)
+  : m_maxRecvBufferSize(_recvBufferSize < MIN_SESSION_RECV_BUFFER_SIZE ?
+                            MIN_SESSION_RECV_BUFFER_SIZE :
+                            _recvBufferSize),
+    m_recvBuffer(_forceSize ? _recvBufferSize : MIN_SESSION_RECV_BUFFER_SIZE)
 {
-    SESSION_LOG(INFO) << "[Session::Session] this=" << this;
-    m_recvBuffer.resize(bufferSize);
-    m_seq2Callback = std::make_shared<std::unordered_map<uint32_t, ResponseCallback::Ptr>>();
+    SESSION_LOG(INFO) << "[Session::Session] this=" << this
+                      << LOG_KV("recvBufferSize", m_maxRecvBufferSize);
+    m_idleCheckTimer = std::make_shared<bcos::Timer>(m_idleTimeInterval, "idleChecker");
 }
 
-Session::~Session()
+Session::~Session() noexcept
 {
     SESSION_LOG(INFO) << "[Session::~Session] this=" << this;
     try
@@ -37,6 +49,10 @@ Session::~Session()
             {
                 socket.close();
             }
+        }
+        if (m_idleCheckTimer)
+        {
+            m_idleCheckTimer->stop();
         }
     }
     catch (...)
@@ -50,26 +66,69 @@ NodeIPEndpoint Session::nodeIPEndpoint() const
     return m_socket->nodeIPEndpoint();
 }
 
-bool Session::actived() const
+bool Session::active() const
 {
     auto server = m_server.lock();
-    return m_actived && server && server->haveNetwork() && m_socket && m_socket->isConnected();
+    return active(server);
+}
+
+bool Session::active(std::shared_ptr<bcos::gateway::Host>& server) const
+{
+    return m_active && server && server->haveNetwork() && m_socket && m_socket->isConnected();
 }
 
 void Session::asyncSendMessage(Message::Ptr message, Options options, SessionCallbackFunc callback)
 {
     auto server = m_server.lock();
-    if (!actived())
+    if (!server)
     {
-        SESSION_LOG(WARNING) << "Session inactived";
+        return;
+    }
+    if (!active(server))
+    {
+        SESSION_LOG(WARNING) << "Session inactive";
         if (callback)
         {
-            server->threadPool()->enqueue([callback] {
-                callback(NetworkException(-1, "Session inactived"), Message::Ptr());
+            server->asyncTo([callback = std::move(callback)] {
+                callback(NetworkException(-1, "Session inactive"), Message::Ptr());
             });
         }
         return;
     }
+
+    // Notice: check message size overflow, if msg->length() > allowMaxMsgSize()
+    if (message->length() > allowMaxMsgSize())
+    {
+        SESSION_LOG(WARNING) << LOG_BADGE("asyncSendMessage") << LOG_DESC("msg size overflow")
+                             << LOG_KV("msgSize", message->length())
+                             << LOG_KV("allowMaxMsgSize", allowMaxMsgSize());
+        if (callback)
+        {
+            server->asyncTo([callback = std::move(callback)] {
+                callback(NetworkException(-1, "Msg size overflow"), Message::Ptr());
+            });
+        }
+        return;
+    }
+
+    auto session = shared_from_this();
+
+    if (auto result =
+            (m_beforeMessageHandler ? m_beforeMessageHandler(session, message) : std::nullopt))
+    {
+        if (callback && result.has_value())
+        {
+            auto error = result.value();
+            auto errorCode = error.errorCode();
+            auto errorMessage = error.errorMessage();
+            server->asyncTo([callback = std::move(callback), errorCode,
+                                errorMessage = std::move(errorMessage)] {
+                callback(NetworkException((int64_t)errorCode, errorMessage), Message::Ptr());
+            });
+        }
+        return;
+    }
+
     if (callback)
     {
         auto handler = std::make_shared<ResponseCallback>();
@@ -94,52 +153,67 @@ void Session::asyncSendMessage(Message::Ptr message, Options options, SessionCal
                 catch (std::exception const& e)
                 {
                     SESSION_LOG(WARNING) << LOG_DESC("async_wait exception")
-                                         << LOG_KV("error", boost::diagnostic_information(e));
+                                         << LOG_KV("message", boost::diagnostic_information(e));
                 }
             });
             handler->timeoutHandler = timeoutHandler;
-            handler->m_startTime = utcSteadyTime();
+            handler->startTime = utcSteadyTime();
         }
-        addSeqCallback(message->seq(), handler);
+
+        m_sessionCallbackManager->addCallback(message->seq(), handler);
     }
-    SESSION_LOG(TRACE) << LOG_DESC("Session asyncSendMessage")
-                       << LOG_KV("seq2Callback.size", m_seq2Callback->size())
-                       << LOG_KV("endpoint", nodeIPEndpoint());
-    std::shared_ptr<bytes> p_buffer = std::make_shared<bytes>();
-    message->encode(*p_buffer);
-    send(p_buffer);
+
+    EncodedMessage::Ptr encodedMessage = std::make_shared<EncodedMessage>();
+    encodedMessage->compress = m_enableCompress;
+    message->encode(*encodedMessage);
+
+    if (c_fileLogLevel <= LogLevel::TRACE)
+    {
+        SESSION_LOG(TRACE) << LOG_DESC("Session asyncSendMessage")
+                           << LOG_KV("endpoint", nodeIPEndpoint()) << LOG_KV("seq", message->seq())
+                           << LOG_KV("packetType", message->packetType())
+                           << LOG_KV("ext", message->ext());
+    }
+
+    send(encodedMessage);
 }
 
-void Session::send(std::shared_ptr<bytes> _msg)
+std::size_t Session::writeQueueSize()
 {
-    if (!actived())
+    Guard lockGuard(x_writeQueue);
+    return m_writeQueue.size();
+}
+
+void Session::send(EncodedMessage::Ptr& _encodedMsg)
+{
+    if (!active())
     {
         return;
     }
 
     if (!m_socket->isConnected())
-        return;
-
-    SESSION_LOG(TRACE) << "send" << LOG_KV("writeQueue size", m_writeQueue.size());
     {
-        Guard l(x_writeQueue);
+        return;
+    }
 
-        m_writeQueue.push(make_pair(_msg, u256(utcTime())));
+    {
+        Guard lockGuard(x_writeQueue);
+        m_writeQueue.push_back(std::move(_encodedMsg));
     }
 
     write();
 }
 
-void Session::onWrite(boost::system::error_code ec, std::size_t, std::shared_ptr<bytes>)
+void Session::onWrite(boost::system::error_code ec, std::size_t /*unused*/)
 {
-    if (!actived())
+    if (!active())
     {
         return;
     }
 
     try
     {
-        updateIdleTimer(m_writeIdleTimer);
+        m_lastWriteTime.store(utcSteadyTime());
         if (ec)
         {
             SESSION_LOG(WARNING) << LOG_DESC("onWrite error sending")
@@ -148,11 +222,14 @@ void Session::onWrite(boost::system::error_code ec, std::size_t, std::shared_ptr
             drop(TCPError);
             return;
         }
+        if (m_writing)
         {
-            if (m_writing)
-            {
-                m_writing = false;
-            }
+            m_writeConstBuffer.clear();
+            m_writing = false;
+        }
+        else
+        {
+            SESSION_LOG(ERROR) << LOG_DESC("onWrite wrong state") << LOG_KV("m_writing", m_writing);
         }
 
         write();
@@ -166,26 +243,81 @@ void Session::onWrite(boost::system::error_code ec, std::size_t, std::shared_ptr
     }
 }
 
+/**
+ * @brief The packets that can be sent are obtained based on the configured policy
+ *
+ * @param encodedMsgs
+ * @param _maxSendDataSize
+ * @param _maxSendMsgCount
+ * @return std::size_t
+ */
+std::size_t Session::tryPopSomeEncodedMsgs(std::vector<EncodedMessage::Ptr>& encodedMsgs,
+    uint32_t _maxSendDataSize, uint32_t _maxSendMsgCount)  // NOLINT
+{
+    // Desc: Try to send multi packets one time to improve the efficiency of sending
+    // data
+    uint64_t totalDataSize = 0;
+    encodedMsgs.clear();
+    encodedMsgs.reserve(_maxSendMsgCount);
+
+    do
+    {
+        // Notice: lock m_writeQueue in the caller
+        if (m_writeQueue.empty())
+        {
+            break;
+        }
+
+        // msg count will overflow
+        if (encodedMsgs.size() >= _maxSendMsgCount)
+        {
+            break;
+        }
+
+        EncodedMessage::Ptr encodedMsg = m_writeQueue.front();
+        totalDataSize += encodedMsg->dataSize();
+
+        // data size will overflow
+        if (totalDataSize > _maxSendDataSize)
+        {
+            // At least one msg pkg
+            if (encodedMsgs.empty())
+            {
+                encodedMsgs.push_back(std::move(encodedMsg));
+                m_writeQueue.pop_front();
+            }
+            else
+            {
+                totalDataSize -= encodedMsg->dataSize();
+            }
+            break;
+        }
+
+        encodedMsgs.push_back(std::move(encodedMsg));
+        m_writeQueue.pop_front();
+    } while (true);
+
+    return totalDataSize;
+}
+
 void Session::write()
 {
-    if (!actived())
+    // TODO: use reference instead of weak_ptr
+    auto server = m_server.lock();
+    if (!active(server))
     {
         return;
     }
 
     try
     {
-        Guard l(x_writeQueue);
-
+        std::vector<EncodedMessage::Ptr> encodedMsgs;
+        Guard lockGuard(x_writeQueue);
         if (m_writing)
         {
             return;
         }
-
         m_writing = true;
-
-        std::pair<std::shared_ptr<bytes>, u256> task;
-        u256 enter_time = u256(0);
 
         if (m_writeQueue.empty())
         {
@@ -193,23 +325,29 @@ void Session::write()
             return;
         }
 
-        task = m_writeQueue.top();
-        m_writeQueue.pop();
+        m_writeConstBuffer.clear();
+        // Try to send multi packets one time to improve the efficiency of sending
+        // data
+        tryPopSomeEncodedMsgs(encodedMsgs, m_maxSendDataSize, m_maxSendMsgCountS);
 
-        enter_time = task.second;
-        auto session = shared_from_this();
-        auto buffer = task.first;
-
-        auto server = m_server.lock();
         if (server && server->haveNetwork())
         {
             if (m_socket->isConnected())
             {
-                // asio::buffer referecne buffer, so buffer need alive before
+                // asio::buffer reference buffer, so buffer need alive before
                 // asio::buffer be used
-                server->asioInterface()->asyncWrite(m_socket, boost::asio::buffer(*buffer),
-                    boost::bind(&Session::onWrite, session, boost::asio::placeholders::error,
-                        boost::asio::placeholders::bytes_transferred, buffer));
+                auto self = std::weak_ptr<Session>(shared_from_this());
+
+                toMultiBuffers(m_writeConstBuffer, encodedMsgs);
+                server->asioInterface()->asyncWrite(m_socket, m_writeConstBuffer,
+                    [self, encodedMsgs](const boost::system::error_code _error, std::size_t _size) {
+                        auto session = self.lock();
+                        if (!session)
+                        {
+                            return;
+                        }
+                        session->onWrite(_error, _size);
+                    });
             }
             else
             {
@@ -238,18 +376,11 @@ void Session::write()
 void Session::drop(DisconnectReason _reason)
 {
     auto server = m_server.lock();
-    if (!m_actived)
+    if (!m_active)
+    {
         return;
-
-    if (m_readIdleTimer)
-    {
-        m_readIdleTimer->cancel();
     }
-    if (m_writeIdleTimer)
-    {
-        m_writeIdleTimer->cancel();
-    }
-    m_actived = false;
+    m_active = false;
 
     int errorCode = P2PExceptionType::Disconnect;
     std::string errorMsg = "Disconnect";
@@ -260,34 +391,18 @@ void Session::drop(DisconnectReason _reason)
     }
 
     SESSION_LOG(INFO) << "drop, call and erase all callback in this session!"
-                      << LOG_KV("endpoint", nodeIPEndpoint());
-    RecursiveGuard l(x_seq2Callback);
-    for (auto& it : *m_seq2Callback)
-    {
-        if (it.second->timeoutHandler)
-        {
-            it.second->timeoutHandler->cancel();
-        }
-        if (it.second->callback)
-        {
-            SESSION_LOG(TRACE) << "drop, call callback by seq" << LOG_KV("seq", it.first);
-            if (server)
-            {
-                auto callback = it.second;
-                server->threadPool()->enqueue([callback, errorCode, errorMsg]() {
-                    callback->callback(NetworkException(errorCode, errorMsg), Message::Ptr());
-                });
-            }
-        }
-    }
-    clearSeqCallback();
+                      << LOG_KV("this", this) << LOG_KV("endpoint", nodeIPEndpoint());
 
     if (server && m_messageHandler)
     {
-        auto handler = m_messageHandler;
-        auto self = shared_from_this();
-        server->threadPool()->enqueue([handler, self, errorCode, errorMsg]() {
-            handler(NetworkException(errorCode, errorMsg), self, Message::Ptr());
+        server->asyncTo([self = weak_from_this(), errorCode, errorMsg = std::move(errorMsg)]() {
+            auto session = self.lock();
+            if (!session)
+            {
+                return;
+            }
+            session->m_messageHandler(
+                NetworkException(errorCode, errorMsg), session, Message::Ptr());
         });
     }
 
@@ -316,17 +431,16 @@ void Session::drop(DisconnectReason _reason)
             {
                 socket->close();
             }
-            auto shutdown_timer =
-                std::make_shared<boost::asio::deadline_timer>(*server->asioInterface()->ioService(),
-                    boost::posix_time::milliseconds(m_shutDownTimeThres));
+            auto shutdown_timer = std::make_shared<boost::asio::deadline_timer>(
+                *(socket->ioService()), boost::posix_time::milliseconds(m_shutDownTimeThres));
             /// async wait for shutdown
             shutdown_timer->async_wait([socket](const boost::system::error_code& error) {
                 /// drop operation has been aborted
                 if (error == boost::asio::error::operation_aborted)
                 {
-                    SESSION_LOG(DEBUG) << "[drop] operation aborted  by async_shutdown"
-                                       << LOG_KV("errorValue", error.value())
-                                       << LOG_KV("message", error.message());
+                    SESSION_LOG(DEBUG)
+                        << "[drop] operation aborted  by async_shutdown"
+                        << LOG_KV("value", error.value()) << LOG_KV("message", error.message());
                     return;
                 }
                 /// shutdown timer error
@@ -366,6 +480,7 @@ void Session::drop(DisconnectReason _reason)
         }
         catch (...)
         {
+            SESSION_LOG(ERROR) << LOG_DESC("drop error") << LOG_KV("endpoint", nodeIPEndpoint());
         }
     }
 }
@@ -377,65 +492,138 @@ void Session::disconnect(DisconnectReason _reason)
 
 void Session::start()
 {
-    if (!m_actived)
+    if (!m_active)
     {
         auto server = m_server.lock();
         if (server && server->haveNetwork())
         {
-            m_actived = true;
-            updateIdleTimer(m_writeIdleTimer);
-            updateIdleTimer(m_readIdleTimer);
+            m_active = true;
+            m_lastWriteTime.store(utcSteadyTime());
+            m_lastReadTime.store(utcSteadyTime());
             server->asioInterface()->strandPost(
-                boost::bind(&Session::doRead, shared_from_this()));  // doRead();
+                [session = shared_from_this()] { session->doRead(); });
         }
     }
+
+    auto self = weak_from_this();
+    m_idleCheckTimer->registerTimeoutHandler([self]() {
+        auto session = self.lock();
+        if (session)
+        {
+            session->checkNetworkStatus();
+        }
+    });
+    m_idleCheckTimer->start();
+
+    SESSION_LOG(INFO) << "[start] start session " << LOG_KV("this", this);
 }
 
 void Session::doRead()
 {
     auto server = m_server.lock();
-    if (m_actived && server && server->haveNetwork())
+    if (m_active && server && server->haveNetwork())
     {
         auto self = std::weak_ptr<Session>(shared_from_this());
         auto asyncRead = [self](boost::system::error_code ec, std::size_t bytesTransferred) {
-            auto s = self.lock();
-            if (s)
+            auto session = self.lock();
+            if (session)
             {
                 if (ec)
                 {
                     SESSION_LOG(WARNING)
-                        << LOG_DESC("doRead error") << LOG_KV("endpoint", s->nodeIPEndpoint())
+                        << LOG_DESC("doRead error") << LOG_KV("endpoint", session->nodeIPEndpoint())
                         << LOG_KV("message", ec.message());
-                    s->drop(TCPError);
+                    session->drop(TCPError);
                     return;
                 }
-                s->updateIdleTimer(s->m_readIdleTimer);
-                s->m_data.insert(s->m_data.end(), s->m_recvBuffer.begin(),
-                    s->m_recvBuffer.begin() + bytesTransferred);
+
+                session->m_lastReadTime.store(utcSteadyTime());
+
+                auto& recvBuffer = session->recvBuffer();
+                recvBuffer.onWrite(bytesTransferred);
 
                 while (true)
                 {
-                    Message::Ptr message = s->m_messageFactory->buildMessage();
-                    ssize_t result =
-                        message->decode(bytesConstRef(s->m_data.data(), s->m_data.size()));
-                    if (result > 0)
+                    Message::Ptr message = session->m_messageFactory->buildMessage();
+                    try
                     {
-                        /// SESSION_LOG(TRACE) << "Decode success: " << result;
-                        NetworkException e(P2PExceptionType::Success, "Success");
-                        s->onMessage(e, message);
-                        s->m_data.erase(s->m_data.begin(), s->m_data.begin() + result);
+                        auto writeBuffer = recvBuffer.asWriteBuffer();
+                        auto readBuffer = recvBuffer.asReadBuffer();
+                        // Note: the decode function may throw exception
+                        ssize_t result = message->decode(readBuffer);
+                        if (result > 0)
+                        {
+                            NetworkException e(P2PExceptionType::Success, "Success");
+                            session->onMessage(e, message);
+                            recvBuffer.onRead(result);
+                        }
+                        else if (result == 0)
+                        {
+                            auto length = message->lengthDirect();
+                            assert(length <= session->allowMaxMsgSize());
+                            if (length > session->allowMaxMsgSize())
+                            {
+                                SESSION_LOG(ERROR)
+                                    << LOG_BADGE("doRead")
+                                    << LOG_DESC("the message size exceeded the allow maximum value")
+                                    << LOG_KV("msgSize", message->length())
+                                    << LOG_KV("allowMaxMsgSize", session->allowMaxMsgSize());
+
+                                session->onMessage(NetworkException(P2PExceptionType::ProtocolError,
+                                                       "ProtocolError(msg overflow)"),
+                                    message);
+                                break;
+                            }
+
+                            if ((length > recvBuffer.recvBufferSize()) ||
+                                (length > writeBuffer.size()) ||
+                                session->maxReadDataSize() > writeBuffer.size())
+                            {
+                                recvBuffer.moveToHeader();
+
+                                // the write buffer is not enough, move the left data to recv
+                                // buffer header for waiting for the next read
+                                if (length >= recvBuffer.recvBufferSize())
+                                {
+                                    auto resizeRecvBufferSize = 2 * length;
+                                    if (resizeRecvBufferSize > session->m_maxRecvBufferSize)
+                                    {
+                                        resizeRecvBufferSize = session->m_maxRecvBufferSize;
+                                    }
+                                    recvBuffer.resizeBuffer(resizeRecvBufferSize);
+
+                                    SESSION_LOG(INFO)
+                                        << LOG_BADGE("doRead")
+                                        << LOG_DESC(
+                                               "the current recv buffer size is not enough for "
+                                               "the "
+                                               "next message, resize the recv buffer")
+                                        << LOG_KV("msgSize", length)
+                                        << LOG_KV("resizeRecvBufferSize", resizeRecvBufferSize)
+                                        << LOG_KV("allowMaxMsgSize", session->allowMaxMsgSize());
+                                }
+                            }
+
+                            session->doRead();
+                            break;
+                        }
+                        else
+                        {
+                            SESSION_LOG(ERROR)
+                                << LOG_BADGE("doRead") << LOG_DESC("decode message error")
+                                << LOG_KV("result", result);
+                            session->onMessage(NetworkException(P2PExceptionType::ProtocolError,
+                                                   "ProtocolError(decode msg error)"),
+                                message);
+                            break;
+                        }
                     }
-                    else if (result == 0)
+                    catch (std::exception const& e)
                     {
-                        s->doRead();
-                        break;
-                    }
-                    else
-                    {
-                        SESSION_LOG(ERROR)
-                            << LOG_DESC("Decode message error") << LOG_KV("result", result);
-                        s->onMessage(
-                            NetworkException(P2PExceptionType::ProtocolError, "ProtocolError"),
+                        SESSION_LOG(ERROR) << LOG_DESC("Decode message exception")
+                                           << LOG_KV("message", boost::diagnostic_information(e));
+                        session->onMessage(NetworkException(P2PExceptionType::ProtocolError,
+                                               "ProtocolError(decode msg exception)"),
                             message);
                         break;
                     }
@@ -445,8 +633,11 @@ void Session::doRead()
 
         if (m_socket->isConnected())
         {
+            auto writeBuffer = m_recvBuffer.asWriteBuffer();
+            std::size_t readSize =
+                (writeBuffer.size() > m_maxReadDataSize ? m_maxReadDataSize : writeBuffer.size());
             server->asioInterface()->asyncReadSome(
-                m_socket, boost::asio::buffer(m_recvBuffer, m_recvBuffer.size()), asyncRead);
+                m_socket, boost::asio::buffer((void*)writeBuffer.data(), readSize), asyncRead);
         }
         else
         {
@@ -457,8 +648,8 @@ void Session::doRead()
     }
     else
     {
-        SESSION_LOG(ERROR) << LOG_DESC("callback doRead failed for session inactived")
-                           << LOG_KV("active", m_actived)
+        SESSION_LOG(ERROR) << LOG_DESC("callback doRead failed for session inactive")
+                           << LOG_KV("active", m_active)
                            << LOG_KV("haveNetwork", server->haveNetwork());
     }
 }
@@ -477,140 +668,129 @@ bool Session::checkRead(boost::system::error_code _ec)
     return true;
 }
 
+
 void Session::onMessage(NetworkException const& e, Message::Ptr message)
 {
     auto server = m_server.lock();
-    if (m_actived && server && server->haveNetwork())
+    if (!server)
     {
-        ResponseCallback::Ptr callbackPtr = getCallbackBySeq(message->seq());
-        if (callbackPtr && message->isRespPacket())
+        return;
+    }
+    server->asyncTo([self = weak_from_this(), e, message]() {
+        try
         {
-            /// SESSION_LOG(TRACE) << "Found callbackPtr: " << message->seq();
+            auto session = self.lock();
+            if (!session)
+            {
+                return;
+            }
+            // TODO: move the logic to Service for deal with the forwarding message
+            if (!message->dstP2PNodeID().empty() &&
+                message->dstP2PNodeID() != session->m_hostNodeID)
+            {
+                session->m_messageHandler(e, session, message);
+                return;
+            }
+            auto server = session->m_server.lock();
+            // in-activate session
+            if (!session->m_active || !server || !server->haveNetwork())
+            {
+                return;
+            }
 
+            if (!message->isRespPacket())
+            {
+                session->m_messageHandler(e, session, message);
+                return;
+            }
+
+            auto callbackManager = session->sessionCallbackManager();
+            auto callbackPtr = callbackManager->getCallback(message->seq(), true);
+            // without callback, call default handler
+            if (!callbackPtr)
+            {
+                SESSION_LOG(WARNING)
+                    << LOG_BADGE("onMessage")
+                    << LOG_DESC("callback not found, maybe the callback timeout")
+                    << LOG_KV("endpoint", session->nodeIPEndpoint())
+                    << LOG_KV("seq", message->seq()) << LOG_KV("resp", message->isRespPacket());
+                return;
+            }
+
+            // with callback
             if (callbackPtr->timeoutHandler)
             {
                 callbackPtr->timeoutHandler->cancel();
             }
-
-            if (callbackPtr->callback)
+            auto callback = callbackPtr->callback;
+            if (!callback)
             {
-                auto callback = callbackPtr->callback;
-                if (callback)
-                {
-                    auto self = std::weak_ptr<Session>(shared_from_this());
-                    server->threadPool()->enqueue([e, callback, self, message]() {
-                        callback(e, message);
-
-                        auto s = self.lock();
-                        if (s)
-                        {
-                            s->removeSeqCallback(message->seq());
-                        }
-                    });
-                }
+                return;
             }
+            callback(e, message);
         }
-        else
+        catch (std::exception const& e)
         {
-            if (m_messageHandler)
-            {
-                SESSION_LOG(TRACE) << "onMessage can't find callback, call default messageHandler"
-                                   << LOG_KV("message.seq", message->seq());
-                auto session = shared_from_this();
-                auto handler = m_messageHandler;
-
-                server->threadPool()->enqueue(
-                    [session, handler, e, message]() { handler(e, session, message); });
-            }
-            else
-            {
-                SESSION_LOG(WARNING) << "onMessage can't find callback and default messageHandler";
-            }
+            SESSION_LOG(WARNING) << LOG_BADGE("onMessage") << LOG_DESC("onMessage exception")
+                                 << LOG_KV("msg", boost::diagnostic_information(e));
         }
-    }
+    });
 }
 
 void Session::onTimeout(const boost::system::error_code& error, uint32_t seq)
 {
     if (error)
     {
-        SESSION_LOG(TRACE) << "timer cancel" << error;
+        // SESSION_LOG(TRACE) << "timer cancel" << error;
         return;
     }
 
     auto server = m_server.lock();
     if (!server)
+    {
         return;
-    ResponseCallback::Ptr callbackPtr = getCallbackBySeq(seq);
-    if (!callbackPtr)
+    }
+    ResponseCallback::Ptr callback = m_sessionCallbackManager->getCallback(seq, true);
+    if (!callback)
+    {
         return;
-    server->threadPool()->enqueue([=]() {
+    }
+    server->asyncTo([callback = std::move(callback)]() {
         NetworkException e(P2PExceptionType::NetworkTimeout, "NetworkTimeout");
-        callbackPtr->callback(e, Message::Ptr());
-        removeSeqCallback(seq);
+        callback->callback(e, Message::Ptr());
     });
 }
 
-void Session::updateIdleTimer(std::shared_ptr<boost::asio::deadline_timer> _idleTimer)
+void Session::checkNetworkStatus()
 {
-    if (!m_actived)
-    {
-        SESSION_LOG(ERROR) << LOG_DESC("Session inactived");
-
-        return;
-    }
-    if (_idleTimer)
-    {
-        _idleTimer->expires_from_now(boost::posix_time::seconds(m_idleTimeInterval));
-
-        auto session = std::weak_ptr<Session>(shared_from_this());
-        _idleTimer->async_wait([session](const boost::system::error_code& error) {
-            auto s = session.lock();
-            if (s)
-            {
-                s->onIdle(error);
-            }
-        });
-    }
-}
-
-void Session::onIdle(const boost::system::error_code& error)
-{
+    m_idleCheckTimer->restart();
     try
     {
-        if (!m_actived)
+        auto now = utcSteadyTime();
+        // read idle
+        if ((m_lastReadTime + m_idleTimeInterval) < now)
         {
-            SESSION_LOG(ERROR) << LOG_DESC("Session inactived");
-
+            SESSION_LOG(WARNING) << LOG_DESC(
+                                        "Long time without read operation, maybe session "
+                                        "inactivated, drop the session")
+                                 << LOG_KV("endpoint", m_socket->nodeIPEndpoint());
+            drop(IdleWaitTimeout);
             return;
         }
-        if (error != boost::asio::error::operation_aborted)
+        // write idle
+        if ((m_lastWriteTime + m_idleTimeInterval) < now)
         {
-            SESSION_LOG(ERROR) << LOG_DESC("Idle connection, disconnect ")
-                               << LOG_KV("endpoint", m_socket->nodeIPEndpoint());
+            SESSION_LOG(WARNING) << LOG_DESC(
+                                        "Long time without write operation, maybe session "
+                                        "inactivated, drop the session")
+                                 << LOG_KV("endpoint", m_socket->nodeIPEndpoint());
             drop(IdleWaitTimeout);
+            return;
         }
     }
-    catch (std::exception& e)
+    catch (std::exception const& e)
     {
-        SESSION_LOG(ERROR) << LOG_DESC("onIdle error")
-                           << LOG_KV("errorMessage", boost::diagnostic_information(e));
-    }
-}
-
-void Session::setHost(std::weak_ptr<Host> host)
-{
-    m_server = host;
-    auto server = m_server.lock();
-    if (server && server->haveNetwork())
-    {
-        m_readIdleTimer =
-            std::make_shared<boost::asio::deadline_timer>(*server->asioInterface()->ioService());
-        m_writeIdleTimer =
-            std::make_shared<boost::asio::deadline_timer>(*server->asioInterface()->ioService());
-    }
-    else
-    {
-        SESSION_LOG(ERROR) << LOG_DESC("create idleTimer failed for the host has no network");
+        SESSION_LOG(WARNING) << LOG_DESC("checkNetworkStatus error")
+                             << LOG_KV("msg", boost::diagnostic_information(e));
     }
 }

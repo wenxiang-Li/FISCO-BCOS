@@ -17,16 +17,18 @@
  * @file HashTest.h
  * @date 2021.03.04
  */
-#include "../../hash/Keccak256.h"
-#include "../../hash/SM3.h"
-#include "../../hash/Sha3.h"
-#include <bcos-framework/interfaces/crypto/CryptoSuite.h>
+#include <bcos-crypto/hash/Keccak256.h>
+#include <bcos-crypto/hash/SM3.h>
+#include <bcos-crypto/hash/Sha3.h>
+#include <bcos-crypto/interfaces/crypto/CryptoSuite.h>
+#include <bcos-utilities/ThreadPool.h>
 #include <bcos-utilities/testutils/TestPromptFixture.h>
 #include <boost/test/unit_test.hpp>
 #include <string>
 
 using namespace bcos;
 using namespace crypto;
+using namespace std::string_view_literals;
 namespace bcos
 {
 namespace test
@@ -36,11 +38,31 @@ BOOST_AUTO_TEST_CASE(testKeccak256)
 {
     auto keccak256 = std::make_shared<Keccak256>();
     auto cryptoSuite = std::make_shared<CryptoSuite>(keccak256, nullptr, nullptr);
+    // test multiple-thread
+    auto worker = std::make_shared<ThreadPool>("testHash", 8);
+    std::atomic<int64_t> totolCount = 1000;
+    worker->enqueue([&]() {
+        if (totolCount <= 0)
+        {
+            return;
+        }
+        while (totolCount > 0)
+        {
+            totolCount -= 1;
+            auto data = "abcde" + std::to_string(totolCount.load());
+            keccak256->hash(data);
+        }
+    });
+    while (totolCount > 0)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
     std::string ts = keccak256->emptyHash().hex();
     BOOST_CHECK_EQUAL(
         ts, std::string("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"));
 
     std::string hashData = "abcde";
+
     ts = keccak256->hash(hashData).hex();
     BOOST_CHECK_EQUAL(
         ts, std::string("6377c7e66081cb65e473c1b95db5195a27d04a7108b468890224bedbe1a8a6eb"));
@@ -49,9 +71,9 @@ BOOST_AUTO_TEST_CASE(testKeccak256)
         *fromHexString("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"));
     BOOST_REQUIRE_EQUAL(emptyKeccak256, keccak256->emptyHash());
 
-    BOOST_REQUIRE_EQUAL(cryptoSuite->hash(""),
+    BOOST_REQUIRE_EQUAL(cryptoSuite->hash(""sv),
         h256("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"));
-    BOOST_REQUIRE_EQUAL(cryptoSuite->hash("hello"),
+    BOOST_REQUIRE_EQUAL(cryptoSuite->hash("hello"sv),
         h256("1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8"));
 }
 BOOST_AUTO_TEST_CASE(testSM3)
@@ -71,10 +93,10 @@ BOOST_AUTO_TEST_CASE(testSM3)
         *fromHexString("1ab21d8355cfa17f8e61194831e81a8f22bec8c728fefb747ed035eb5082aa2b"));
     BOOST_REQUIRE_EQUAL(emptySM3, sm3->emptyHash());
 
-    BOOST_REQUIRE_EQUAL(cryptoSuite->hash(""),
+    BOOST_REQUIRE_EQUAL(cryptoSuite->hash(""sv),
         h256("1ab21d8355cfa17f8e61194831e81a8f22bec8c728fefb747ed035eb5082aa2b"));
 
-    BOOST_REQUIRE_EQUAL(cryptoSuite->hash("hello"),
+    BOOST_REQUIRE_EQUAL(cryptoSuite->hash("hello"sv),
         h256("becbbfaae6548b8bf0cfcad5a27183cd1be6093b1cceccc303d9c61d0a645268"));
 }
 BOOST_AUTO_TEST_CASE(testSha3)
@@ -94,10 +116,10 @@ BOOST_AUTO_TEST_CASE(testSha3)
         *fromHexString("a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a"));
     BOOST_REQUIRE_EQUAL(emptySha3, sha3->emptyHash());
 
-    BOOST_REQUIRE_EQUAL(cryptoSuite->hash(""),
+    BOOST_REQUIRE_EQUAL(cryptoSuite->hash(""sv),
         h256("a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a"));
 
-    BOOST_REQUIRE_EQUAL(cryptoSuite->hash("hello"),
+    BOOST_REQUIRE_EQUAL(cryptoSuite->hash("hello"sv),
         h256("3338be694f50c5f338814986cdf0686453a888b84f424d792af4b9202398f392"));
 }
 BOOST_AUTO_TEST_SUITE_END()

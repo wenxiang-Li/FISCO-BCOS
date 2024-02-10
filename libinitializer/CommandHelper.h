@@ -25,6 +25,7 @@ namespace bcos
 namespace initializer
 {
 void printVersion();
+void showNodeVersionMetric();
 void initCommandLine(int argc, char* argv[]);
 
 struct Params
@@ -33,6 +34,6 @@ struct Params
     std::string genesisFilePath;
     float txSpeed;
 };
-Params initLocalNodeCommandLine(int argc, const char* argv[], bool _autoSendTx);
+Params initAirNodeCommandLine(int argc, const char* argv[], bool _autoSendTx);
 }  // namespace initializer
 }  // namespace bcos

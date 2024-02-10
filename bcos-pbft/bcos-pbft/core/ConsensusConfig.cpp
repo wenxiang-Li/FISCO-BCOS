@@ -28,15 +28,15 @@ using namespace bcos::consensus;
 // And the cost of copying the pointer is more efficient
 ConsensusNodeList ConsensusConfig::consensusNodeList() const
 {
-    ReadGuard l(x_consensusNodeList);
+    ReadGuard lock(x_consensusNodeList);
     return *m_consensusNodeList;
 }
 
 NodeIDs ConsensusConfig::consensusNodeIDList(bool _excludeSelf) const
 {
-    ReadGuard l(x_consensusNodeList);
+    ReadGuard lock(x_consensusNodeList);
     std::vector<PublicPtr> nodeIDList;
-    for (auto node : *m_consensusNodeList)
+    for (const auto& node : *m_consensusNodeList)
     {
         if (_excludeSelf && node->nodeID()->data() == nodeID()->data())
         {
@@ -57,7 +57,7 @@ bool ConsensusConfig::compareConsensusNode(
     size_t i = 0;
     for (auto const& node : _left)
     {
-        auto compareNode = _right[i];
+        const auto& compareNode = _right[i];
         if (node->nodeID()->data() != compareNode->nodeID()->data() ||
             node->weight() != compareNode->weight())
         {
@@ -67,9 +67,41 @@ bool ConsensusConfig::compareConsensusNode(
     }
     return true;
 }
+
+
+bool ConsensusConfig::isNodeExist(
+    ConsensusNodeInterface::Ptr const& _node, ConsensusNodeList const& _nodeList)
+{
+    auto iter = std::find_if(_nodeList.begin(), _nodeList.end(),
+        [_node](const ConsensusNodeInterface::Ptr& _consensusNode) {
+            return _node->nodeID()->data() == _consensusNode->nodeID()->data() &&
+                   _node->weight() == _consensusNode->weight();
+        });
+    return !(_nodeList.end() == iter);
+}
+
+void ConsensusConfig::setObserverNodeList(ConsensusNodeList& _observerNodeList)
+{
+    std::sort(_observerNodeList.begin(), _observerNodeList.end(), ConsensusNodeComparator());
+    // update the observer list
+    {
+        UpgradableGuard lock(x_observerNodeList);
+        // consensus node list have not been changed
+        if (compareConsensusNode(_observerNodeList, *m_observerNodeList))
+        {
+            m_observerNodeListUpdated = false;
+            return;
+        }
+        UpgradeGuard ul(lock);
+        // consensus node list have been changed
+        *m_observerNodeList = _observerNodeList;
+        m_observerNodeListUpdated = true;
+    }
+}
+
 void ConsensusConfig::setConsensusNodeList(ConsensusNodeList& _consensusNodeList)
 {
-    if (_consensusNodeList.size() == 0)
+    if (_consensusNodeList.empty())
     {
         BOOST_THROW_EXCEPTION(InitConsensusException()
                               << errinfo_comment("Must contain at least one consensus node"));
@@ -78,21 +110,21 @@ void ConsensusConfig::setConsensusNodeList(ConsensusNodeList& _consensusNodeList
     std::sort(_consensusNodeList.begin(), _consensusNodeList.end(), ConsensusNodeComparator());
     // update the consensus list
     {
-        UpgradableGuard l(x_consensusNodeList);
+        UpgradableGuard lock(x_consensusNodeList);
         // consensus node list have not been changed
         if (compareConsensusNode(_consensusNodeList, *m_consensusNodeList))
         {
-            m_nodeUpdated = false;
+            m_consensusNodeListUpdated = false;
             return;
         }
-        UpgradeGuard ul(l);
+        UpgradeGuard ul(lock);
         // consensus node list have been changed
         *m_consensusNodeList = _consensusNodeList;
-        m_nodeUpdated = true;
+        m_consensusNodeListUpdated = true;
     }
     {
         // update the consensusNodeNum
-        ReadGuard l(x_consensusNodeList);
+        ReadGuard lock(x_consensusNodeList);
         m_consensusNodeNum.store(m_consensusNodeList->size());
     }
     // update the nodeIndex
@@ -103,7 +135,7 @@ void ConsensusConfig::setConsensusNodeList(ConsensusNodeList& _consensusNodeList
     }
     // update quorum
     updateQuorum();
-    CONSENSUS_LOG(INFO) << LOG_DESC("updateConsensusNodeList")
+    CONSENSUS_LOG(INFO) << METRIC << LOG_DESC("updateConsensusNodeList")
                         << LOG_KV("nodeNum", m_consensusNodeNum) << LOG_KV("nodeIndex", nodeIndex)
                         << LOG_KV("committedIndex",
                                (committedProposal() ? committedProposal()->index() : 0))
@@ -112,10 +144,10 @@ void ConsensusConfig::setConsensusNodeList(ConsensusNodeList& _consensusNodeList
 
 IndexType ConsensusConfig::getNodeIndexByNodeID(bcos::crypto::PublicPtr _nodeID)
 {
-    ReadGuard l(x_consensusNodeList);
+    ReadGuard lock(x_consensusNodeList);
     IndexType nodeIndex = NON_CONSENSUS_NODE;
     IndexType i = 0;
-    for (auto _consensusNode : *m_consensusNodeList)
+    for (const auto& _consensusNode : *m_consensusNodeList)
     {
         if (_consensusNode->nodeID()->data() == _nodeID->data())
         {
@@ -129,7 +161,7 @@ IndexType ConsensusConfig::getNodeIndexByNodeID(bcos::crypto::PublicPtr _nodeID)
 
 ConsensusNodeInterface::Ptr ConsensusConfig::getConsensusNodeByIndex(IndexType _nodeIndex)
 {
-    ReadGuard l(x_consensusNodeList);
+    ReadGuard lock(x_consensusNodeList);
     if (_nodeIndex < m_consensusNodeList->size())
     {
         return (*m_consensusNodeList)[_nodeIndex];

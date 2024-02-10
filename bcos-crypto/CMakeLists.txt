@@ -1,48 +1,31 @@
-#------------------------------------------------------------------------------
-# Top-level CMake file for bcos-crypto
-# ------------------------------------------------------------------------------
-# Copyright (C) 2021 bcos-crypto
-# SPDX-License-Identifier: Apache-2.0
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#------------------------------------------------------------------------------
-
-cmake_minimum_required(VERSION 3.10)
-set(CMAKE_OSX_DEPLOYMENT_TARGET "10.13" CACHE STRING "Minimum OS X deployment version")
-
 project(bcos-crypto VERSION ${VERSION})
 
-file(GLOB_RECURSE SRCS encrypt/*.cpp hash/*.cpp signature/*.cpp)
-
-hunter_add_package(wedpr-crypto)
-find_package(wedpr-crypto CONFIG REQUIRED)
-
-add_library(${CRYPTO_TARGET} ${SRCS})
-target_link_libraries(${CRYPTO_TARGET} PUBLIC wedpr-crypto::crypto wedpr-crypto::extend-crypto ${UTILITIES_TARGET} pthread dl)
-
-option(TOOLS "compile demo or not" OFF)
-
-if(TOOLS)
-add_subdirectory(demo)
-endif()
-
-if (TESTS)
-    enable_testing()
-    set(CTEST_OUTPUT_ON_FAILURE TRUE)
-    add_subdirectory(test)
-endif()
-
-# for code coverage
-if (COVERAGE)
-    include(Coverage)
-    config_coverage("coverage" "'/usr*' '${CMAKE_CURRENT_SOURCE_DIR}/bcos-cmake-scripts*' '${CMAKE_CURRENT_SOURCE_DIR}/test/bcos-test*'")
+file(GLOB_RECURSE ALL_SRCS bcos-crypto/*.cpp)
+set(LIB_LIST OpenSSL::SSL OpenSSL::Crypto wedprcrypto::crypto wedprcrypto::zkp bcos-utilities bcos-concepts TBB::tbb HSM-CRYPTO::sdf-crypto unofficial::secp256k1 unofficial::secp256k1_precomputed)
+if(ONLY_CPP_SDK)
+    list(REMOVE_ITEM ALL_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/bcos-crypto/zkp/discretezkp/DiscreteLogarithmZkp.cpp)
+    list(REMOVE_ITEM LIB_LIST wedprcrypto::zkp)
 endif ()
+
+find_package(OpenSSL REQUIRED)
+find_package(TBB REQUIRED)
+find_package(wedprcrypto REQUIRED)
+find_package(unofficial-secp256k1 REQUIRED)
+find_package(HSM-CRYPTO REQUIRED)
+
+add_library(bcos-crypto STATIC ${ALL_SRCS})
+target_link_libraries(bcos-crypto PUBLIC ${LIB_LIST})
+
+if(NOT WIN32)
+    target_compile_options(bcos-crypto PUBLIC "-Wno-ignored-attributes")
+endif()
+
+if(TESTS)
+    enable_testing()
+    add_subdirectory(test)
+    add_subdirectory(demo)
+endif()
+
+include(GNUInstallDirs)
+install(TARGETS bcos-crypto EXPORT fiscobcosTargets ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+install(DIRECTORY "bcos-crypto" DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}" FILES_MATCHING PATTERN "*.h")

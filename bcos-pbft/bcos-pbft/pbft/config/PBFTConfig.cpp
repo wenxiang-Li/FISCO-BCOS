@@ -36,7 +36,7 @@ void PBFTConfig::resetConfig(LedgerConfig::Ptr _ledgerConfig, bool _syncedBlock)
     {
         return;
     }
-    PBFT_LOG(INFO) << LOG_DESC("resetConfig")
+    PBFT_LOG(INFO) << METRIC << LOG_DESC("resetConfig")
                    << LOG_KV("committedIndex", _ledgerConfig->blockNumber())
                    << LOG_KV("propHash", _ledgerConfig->hash().abridged())
                    << LOG_KV("blockCountLimit", _ledgerConfig->blockTxCountLimit())
@@ -51,34 +51,65 @@ void PBFTConfig::resetConfig(LedgerConfig::Ptr _ledgerConfig, bool _syncedBlock)
     // set blockTxCountLimit
     setBlockTxCountLimit(_ledgerConfig->blockTxCountLimit());
     // set ConsensusNodeList
-    auto& consensusList = _ledgerConfig->mutableConsensusNodeList();
+
+    bcos::consensus::ConsensusNodeList consensusList;
+    bcos::consensus::ConsensusNodeList observerList;
+    consensusList = _ledgerConfig->consensusNodeList();
+    observerList = _ledgerConfig->observerNodeList() + _ledgerConfig->candidateSealerNodeList();
     setConsensusNodeList(consensusList);
+    setObserverNodeList(observerList);
     // set leader_period
     setLeaderSwitchPeriod(_ledgerConfig->leaderSwitchPeriod());
     // reset the timer
-    resetTimer();
+    freshTimer();
 
     if (_ledgerConfig->sealerId() == -1)
     {
-        PBFT_LOG(INFO) << LOG_DESC("^^^^^^^^Report") << printCurrentState();
+        PBFT_LOG(INFO) << METRIC << LOG_DESC("^^^^^^^^Report") << printCurrentState();
     }
     else
     {
-        PBFT_LOG(INFO) << LOG_DESC("^^^^^^^^Report") << LOG_KV("sealer", _ledgerConfig->sealerId())
+        PBFT_LOG(INFO) << METRIC << LOG_DESC("^^^^^^^^Report")
+                       << LOG_KV("sealer", _ledgerConfig->sealerId())
                        << LOG_KV("txs", _ledgerConfig->txsSize()) << printCurrentState();
     }
-    // notify the txpool validator to update the consensusNodeList.
-    m_validator->updateValidatorConfig(consensusList, _ledgerConfig->observerNodeList());
+    if (m_compatibilityVersion != _ledgerConfig->compatibilityVersion())
+    {
+        PBFT_LOG(INFO) << LOG_DESC("compatibilityVersion updated")
+                       << LOG_KV("version", (bcos::protocol::BlockVersion)m_compatibilityVersion)
+                       << LOG_KV("updatedVersion", (bcos::protocol::BlockVersion)(
+                                                       _ledgerConfig->compatibilityVersion()));
+        m_compatibilityVersion = _ledgerConfig->compatibilityVersion();
+        if (m_versionNotification && m_asMasterNode)
+        {
+            m_versionNotification(m_compatibilityVersion);
+        }
+    }
+
+    // notify the txpool validator to update the consensusNodeList and the observerNodeList
+    if (m_consensusNodeListUpdated || m_observerNodeListUpdated)
+    {
+        m_validator->updateValidatorConfig(consensusList, observerList);
+        PBFT_LOG(INFO) << LOG_DESC("updateValidatorConfig")
+                       << LOG_KV("consensusNodeListUpdated", m_consensusNodeListUpdated)
+                       << LOG_KV("observerNodeListUpdated", m_observerNodeListUpdated)
+                       << LOG_KV("consensusNodeSize", consensusList.size())
+                       << LOG_KV("observerNodeSize", observerList.size());
+    }
+    if (m_rpbftConfigTools != nullptr)
+    {
+        m_rpbftConfigTools->resetConfig(_ledgerConfig);
+    }
 
     // notify the latest block number to the sealer
     if (m_stateNotifier)
     {
-        m_stateNotifier(_ledgerConfig->blockNumber());
+        m_stateNotifier(_ledgerConfig->blockNumber(), _ledgerConfig->hash());
     }
     // notify the latest block to the sync module
     if (m_newBlockNotifier && !_syncedBlock)
     {
-        m_newBlockNotifier(_ledgerConfig, [_ledgerConfig](Error::Ptr _error) {
+        m_newBlockNotifier(_ledgerConfig, [_ledgerConfig](auto&& _error) {
             if (_error)
             {
                 PBFT_LOG(WARNING) << LOG_DESC("asyncNotifyNewBlock to sync module failed")
@@ -93,7 +124,6 @@ void PBFTConfig::resetConfig(LedgerConfig::Ptr _ledgerConfig, bool _syncedBlock)
     // the node is syncing, reset the timeout state to false for view recovery
     if (m_syncingHighestNumber > _ledgerConfig->blockNumber())
     {
-        m_timeoutState = true;
         m_syncingState = true;
         // notify resetSealing(the syncing node should not seal block)
         notifyResetSealing();
@@ -166,7 +196,7 @@ void PBFTConfig::reNotifySealer(bcos::protocol::BlockNumber _index)
 
 bool PBFTConfig::canHandleNewProposal()
 {
-    ReadGuard l(x_committedProposal);
+    ReadGuard lock(x_committedProposal);
     bcos::protocol::BlockNumber committedIndex = 0;
     if (m_committedProposal)
     {
@@ -189,14 +219,10 @@ bool PBFTConfig::canHandleNewProposal(PBFTBaseMessageInterface::Ptr _msg)
     {
         return true;
     }
-    ReadGuard l(x_committedProposal);
+    ReadGuard lock(x_committedProposal);
     auto committedIndex = m_committedProposal->index();
-    if (_msg->index() <= committedIndex || _msg->index() <= m_waitSealUntil ||
-        _msg->index() <= m_waitResealUntil)
-    {
-        return true;
-    }
-    return false;
+    return _msg->index() <= committedIndex || _msg->index() <= m_waitSealUntil ||
+           _msg->index() <= m_waitResealUntil;
 }
 
 bool PBFTConfig::tryTriggerFastViewChange(IndexType _leaderIndex)
@@ -207,7 +233,7 @@ bool PBFTConfig::tryTriggerFastViewChange(IndexType _leaderIndex)
     }
     auto nodeList = connectedNodeList();
     // empty connection
-    if (nodeList.size() == 0)
+    if (nodeList.empty())
     {
         return false;
     }
@@ -227,12 +253,11 @@ bool PBFTConfig::tryTriggerFastViewChange(IndexType _leaderIndex)
         return false;
     }
     // Note: must register m_faultyDiscriminator before start the PBFTEngine
-    if (nodeList.count(leaderNodeInfo->nodeID()) &&
-        !m_faultyDiscriminator(leaderNodeInfo->nodeID()))
+    if (!m_faultyDiscriminator(leaderNodeInfo->nodeID()))
     {
         return false;
     }
-    PBFT_LOG(INFO) << LOG_DESC("tryTriggerFastViewChange for the leader disconnect")
+    PBFT_LOG(INFO) << LOG_DESC("tryTriggerFastViewChange for the faulty leader")
                    << LOG_KV("leaderIndex", _leaderIndex)
                    << LOG_KV("leader", leaderNodeInfo->nodeID()->shortHex()) << printCurrentState();
     m_fastViewChangeHandler();
@@ -243,6 +268,9 @@ bool PBFTConfig::tryTriggerFastViewChange(IndexType _leaderIndex)
 
 void PBFTConfig::notifySealer(BlockNumber _progressedIndex, bool _enforce)
 {
+    auto startT = utcSteadyTime();
+    RecursiveGuard lock(m_mutex);
+    auto lockNotifyT = utcSteadyTime() - startT;
     auto currentLeader = leaderIndex(_progressedIndex);
     if (currentLeader != nodeIndex())
     {
@@ -274,6 +302,7 @@ void PBFTConfig::notifySealer(BlockNumber _progressedIndex, bool _enforce)
     if (m_sealEndIndex.load() >= endProposalIndex)
     {
         PBFT_LOG(INFO) << LOG_DESC("notifySealer return for invalid seal range")
+                       << LOG_KV("lockNotifyT", lockNotifyT)
                        << LOG_KV("currentEndIndex", m_sealEndIndex)
                        << LOG_KV("expectedEndIndex", endProposalIndex) << printCurrentState();
         return;
@@ -282,8 +311,14 @@ void PBFTConfig::notifySealer(BlockNumber _progressedIndex, bool _enforce)
     if (startSealIndex > endProposalIndex)
     {
         PBFT_LOG(INFO) << LOG_DESC("notifySealer return for invalid seal range")
+                       << LOG_KV("lockNotifyT", lockNotifyT)
                        << LOG_KV("expectedStartIndex", startSealIndex)
                        << LOG_KV("expectedEndIndex", endProposalIndex) << printCurrentState();
+        return;
+    }
+    // already notified
+    if (m_sealEndIndex >= endProposalIndex && m_sealStartIndex <= startSealIndex)
+    {
         return;
     }
     auto committedIndex = m_committedProposal->index();
@@ -291,9 +326,19 @@ void PBFTConfig::notifySealer(BlockNumber _progressedIndex, bool _enforce)
     {
         PBFT_LOG(INFO) << LOG_DESC(
                               "Not notify the sealer to sealing for txs of some proposals have not "
-                              "been resetted success")
+                              "been reset success")
                        << LOG_KV("resettingProposalSize", m_validator->resettingProposalSize())
                        << LOG_KV("startSealIndex", startSealIndex) << printCurrentState();
+        // notify the leader to seal when all txs of all proposals have been reset
+        auto self = weak_from_this();
+        m_validator->setVerifyCompletedHook([self, _progressedIndex, _enforce]() {
+            auto config = self.lock();
+            if (!config)
+            {
+                return;
+            }
+            config->notifySealer(_progressedIndex, _enforce);
+        });
         return;
     }
     asyncNotifySealProposal(startSealIndex, endProposalIndex, blockTxCountLimit());
@@ -301,8 +346,8 @@ void PBFTConfig::notifySealer(BlockNumber _progressedIndex, bool _enforce)
     m_sealStartIndex = startSealIndex;
     m_sealEndIndex = endProposalIndex;
     PBFT_LOG(INFO) << LOG_DESC("notifySealer: notify the new leader to seal block")
-                   << LOG_KV("idx", nodeIndex()) << LOG_KV("startIndex", startSealIndex)
-                   << LOG_KV("endIndex", endProposalIndex)
+                   << LOG_KV("lockNotifyT", lockNotifyT) << LOG_KV("idx", nodeIndex())
+                   << LOG_KV("startIndex", startSealIndex) << LOG_KV("endIndex", endProposalIndex)
                    << LOG_KV("notifyBeginIndex", _progressedIndex)
                    << LOG_KV("waitSealUntil", m_waitSealUntil)
                    << LOG_KV("waitResealUntil", m_waitResealUntil)
@@ -320,7 +365,7 @@ void PBFTConfig::asyncNotifySealProposal(
     {
         return;
     }
-    auto self = std::weak_ptr<PBFTConfig>(shared_from_this());
+    auto self = weak_from_this();
     m_sealProposalNotifier(_proposalIndex, _proposalEndIndex, _maxTxsToSeal,
         [_proposalIndex, _proposalEndIndex, _maxTxsToSeal, self, _retryTime](Error::Ptr _error) {
             if (_error == nullptr)
@@ -347,7 +392,7 @@ void PBFTConfig::asyncNotifySealProposal(
             catch (std::exception const& e)
             {
                 PBFT_LOG(WARNING) << LOG_DESC("asyncNotifySealProposal exception")
-                                  << LOG_KV("error", boost::diagnostic_information(e));
+                                  << LOG_KV("message", boost::diagnostic_information(e));
             }
         });
 }
@@ -360,8 +405,8 @@ uint64_t PBFTConfig::minRequiredQuorum() const
 void PBFTConfig::updateQuorum()
 {
     m_totalQuorum.store(0);
-    ReadGuard l(x_consensusNodeList);
-    for (auto consensusNode : *m_consensusNodeList)
+    ReadGuard lock(x_consensusNodeList);
+    for (const auto& consensusNode : *m_consensusNodeList)
     {
         m_totalQuorum += consensusNode->weight();
     }
@@ -394,7 +439,7 @@ IndexType PBFTConfig::leaderIndexInNewViewPeriod(
 
 PBFTProposalInterface::Ptr PBFTConfig::populateCommittedProposal()
 {
-    ReadGuard l(x_committedProposal);
+    ReadGuard lock(x_committedProposal);
     if (!m_committedProposal)
     {
         return nullptr;
@@ -420,6 +465,28 @@ std::string PBFTConfig::printCurrentState()
                  << LOG_KV("unsealedTxs", m_unsealedTxsSize.load())
                  << LOG_KV("sealUntil", m_waitSealUntil)
                  << LOG_KV("waitResealUntil", m_waitResealUntil)
+                 << LOG_KV("consensusTimeout", m_consensusTimeout.load())
                  << LOG_KV("nodeId", nodeID()->shortHex());
+    if (c_fileLogLevel <= DEBUG)
+    {
+        stringstream << LOG_KV("nodeAddr", cryptoSuite()->calculateAddress(nodeID())).hex();
+    }
     return stringstream.str();
+}
+
+void PBFTConfig::tryToSyncTxs()
+{
+    // should not try to request txs to peer when unsealedTxs > 0
+    // only the leader need tryToSyncTxs
+    if (m_unsealedTxsSize > 0 || m_timer->running() || getLeader() != nodeIndex())
+    {
+        return;
+    }
+    PBFT_LOG(INFO) << LOG_DESC("tryToSyncTxs: try to request unsealing txs from peer")
+                   << printCurrentState();
+
+    if (m_txsStatusSyncHandler)
+    {
+        m_txsStatusSyncHandler();
+    }
 }

@@ -21,21 +21,20 @@
 #pragma once
 #include "engine/BlockValidator.h"
 #include "engine/PBFTEngine.h"
-#include <bcos-framework/interfaces/consensus/ConsensusInterface.h>
-#include <bcos-tool/LedgerConfigFetcher.h>
-namespace bcos
-{
-namespace consensus
+#include <bcos-framework/consensus/ConsensusInterface.h>
+
+#include <utility>
+namespace bcos::consensus
 {
 class PBFTImpl : public ConsensusInterface
 {
 public:
     using Ptr = std::shared_ptr<PBFTImpl>;
-    explicit PBFTImpl(PBFTEngine::Ptr _pbftEngine) : m_pbftEngine(_pbftEngine)
+    explicit PBFTImpl(PBFTEngine::Ptr _pbftEngine) : m_pbftEngine(std::move(_pbftEngine))
     {
         m_blockValidator = std::make_shared<BlockValidator>(m_pbftEngine->pbftConfig());
     }
-    virtual ~PBFTImpl() { stop(); }
+    ~PBFTImpl() override { stop(); }
 
     void start() override;
     void stop() override;
@@ -60,10 +59,10 @@ public:
 
     void notifyHighestSyncingNumber(bcos::protocol::BlockNumber _blockNumber) override;
     void asyncNoteUnSealedTxsSize(
-        size_t _unsealedTxsSize, std::function<void(Error::Ptr)> _onRecvResponse) override;
+        uint64_t _unsealedTxsSize, std::function<void(Error::Ptr)> _onRecvResponse) override;
     void setLedgerFetcher(bcos::tool::LedgerConfigFetcher::Ptr _ledgerFetcher)
     {
-        m_ledgerFetcher = _ledgerFetcher;
+        m_pbftEngine->setLedgerFetcher(_ledgerFetcher);
     }
     PBFTEngine::Ptr pbftEngine() { return m_pbftEngine; }
 
@@ -78,9 +77,9 @@ public:
     }
 
     // notify the sealer the latest blockNumber
-    void registerStateNotifier(std::function<void(bcos::protocol::BlockNumber)> _stateNotifier)
+    void registerStateNotifier(std::function<void(bcos::protocol::BlockNumber, crypto::HashType const&)> _stateNotifier)
     {
-        m_pbftEngine->pbftConfig()->registerStateNotifier(_stateNotifier);
+        m_pbftEngine->pbftConfig()->registerStateNotifier(std::move(_stateNotifier));
     }
     // the sync module notify the consensus module the new block
     void registerNewBlockNotifier(
@@ -111,11 +110,21 @@ public:
         m_pbftEngine->pbftConfig()->registerSealerResetNotifier(_sealerResetNotifier);
     }
 
+    // handler to broadcast empty-txs status and try to request txs from peers
+    void registerTxsStatusSyncHandler(std::function<void()> const& _txsStatusSyncHandler)
+    {
+        m_pbftEngine->pbftConfig()->registerTxsStatusSyncHandler(_txsStatusSyncHandler);
+    }
+
     ConsensusNodeList consensusNodeList() const override
     {
         return m_pbftEngine->pbftConfig()->consensusNodeList();
     }
     uint64_t nodeIndex() const override { return m_pbftEngine->pbftConfig()->nodeIndex(); }
+    consensus::ConsensusConfigInterface::ConstPtr consensusConfig() const override
+    {
+        return m_pbftEngine->pbftConfig();
+    }
     void asyncGetConsensusStatus(
         std::function<void(Error::Ptr, std::string)> _onGetConsensusStatus) override;
 
@@ -128,12 +137,35 @@ public:
             _onResponse(nullptr);
         }
     }
+    virtual void enableAsMasterNode(bool _isMasterNode);
+
+    virtual bool masterNode() const { return m_masterNode.load(); }
+
+    virtual void registerVersionInfoNotification(
+        std::function<void(uint32_t _version)> _versionNotification)
+    {
+        m_pbftEngine->pbftConfig()->registerVersionInfoNotification(_versionNotification);
+    }
+
+    uint32_t compatibilityVersion() const override
+    {
+        return m_pbftEngine->pbftConfig()->compatibilityVersion();
+    }
+
+    void clearExceptionProposalState(bcos::protocol::BlockNumber _number) override
+    {
+        m_pbftEngine->clearExceptionProposalState(_number);
+    }
+
+    bool shouldRotateSealers(protocol::BlockNumber _number) const override
+    {
+        return m_pbftEngine->shouldRotateSealers(_number);
+    }
 
 protected:
     PBFTEngine::Ptr m_pbftEngine;
     BlockValidator::Ptr m_blockValidator;
-    bcos::tool::LedgerConfigFetcher::Ptr m_ledgerFetcher;
     std::atomic_bool m_running = {false};
+    std::atomic_bool m_masterNode = {false};
 };
-}  // namespace consensus
-}  // namespace bcos
+}  // namespace bcos::consensus

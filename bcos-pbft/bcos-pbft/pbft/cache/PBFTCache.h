@@ -22,16 +22,14 @@
 #include "../config/PBFTConfig.h"
 #include "../interfaces/PBFTMessageInterface.h"
 
-namespace bcos
-{
-namespace consensus
+namespace bcos::consensus
 {
 class PBFTCache : public std::enable_shared_from_this<PBFTCache>
 {
 public:
     using Ptr = std::shared_ptr<PBFTCache>;
     PBFTCache(PBFTConfig::Ptr _config, bcos::protocol::BlockNumber _index);
-    virtual ~PBFTCache() {}
+    virtual ~PBFTCache() = default;
     bool existPrePrepare(PBFTMessageInterface::Ptr _prePrepareMsg);
     bool conflictWithProcessedReq(PBFTMessageInterface::Ptr _msg);
     bool conflictWithPrecommitReq(PBFTMessageInterface::Ptr _prePrepareMsg);
@@ -64,21 +62,43 @@ public:
         {
             return;
         }
+        // NOTE: If prePrepare is not null, it means prePrepare is already exist, and it will be
+        // replaced without reset proposal txs to unsealed. So we need to add the old prePrepare to
+        // exception prePrepare list, and it will be processed resetTxs when finalizeConsensus and
+        // reachNewView.
+        if (m_prePrepare && m_prePrepare->consensusProposal())
+        {
+            m_exceptionPrePrepareList.push_back(m_prePrepare);
+        }
         m_prePrepare = _prePrepareMsg;
         PBFT_LOG(INFO) << LOG_DESC("addPrePrepareCache") << printPBFTMsgInfo(_prePrepareMsg)
                        << LOG_KV("sys", _prePrepareMsg->consensusProposal()->systemProposal())
                        << m_config->printCurrentState();
     }
 
+    void addExceptionPrePrepareCache(PBFTMessageInterface::Ptr _prePrepareMsg)
+    {
+        m_exceptionPrePrepareList.push_back(std::move(_prePrepareMsg));
+    }
+
     bcos::protocol::BlockNumber index() const { return m_index; }
 
     virtual PBFTMessageInterface::Ptr preCommitCache() { return m_precommit; }
+    // Note: only called when receive checkPoint-triggered-proposal response
+    virtual void setPrecommitCache(PBFTMessageInterface::Ptr _precommit)
+    {
+        PBFT_LOG(INFO) << LOG_DESC("setPrecommitCache") << printPBFTMsgInfo(_precommit);
+        m_precommit = _precommit;
+        m_precommitWithoutData = _precommit;
+    }
     virtual PBFTMessageInterface::Ptr preCommitWithoutData() { return m_precommitWithoutData; }
     virtual bool checkAndPreCommit();
     virtual bool checkAndCommit();
     virtual bool shouldStopTimer();
     // reset the cache after viewchange
     virtual void resetCache(ViewType _curView);
+
+    virtual void resetExceptionCache(ViewType _curView);
 
     virtual void setCheckPointProposal(PBFTProposalInterface::Ptr _proposal);
     PBFTProposalInterface::Ptr checkPointProposal() { return m_checkpointProposal; }
@@ -100,7 +120,7 @@ public:
     void registerCommittedIndexNotify(
         std::function<void(bcos::protocol::BlockNumber)> _committedIndexNotifier)
     {
-        m_committedIndexNotifier = _committedIndexNotifier;
+        m_committedIndexNotifier = std::move(_committedIndexNotifier);
     }
 
     uint64_t getCollectedCheckPointWeight(bcos::crypto::HashType const& _hash)
@@ -111,7 +131,15 @@ public:
         }
         return 0;
     }
-    void init();
+
+    void resetState()
+    {
+        m_stableCommitted.store(false);
+        m_submitted.store(false);
+        m_precommitted.store(false);
+        m_checkpointProposal = nullptr;
+        m_checkPointStartTime = 0;
+    }
 
 protected:
     bool checkPrePrepareProposalStatus();
@@ -197,16 +225,17 @@ protected:
     QuorumRecoderType m_commitReqWeight;
 
     PBFTMessageInterface::Ptr m_prePrepare = nullptr;
+    std::vector<PBFTMessageInterface::Ptr> m_exceptionPrePrepareList = {};
     PBFTMessageInterface::Ptr m_precommit = nullptr;
     PBFTMessageInterface::Ptr m_precommitWithoutData = nullptr;
 
     PBFTProposalInterface::Ptr m_checkpointProposal = nullptr;
+    // time record for checkPoint start
+    std::uint64_t m_checkPointStartTime = 0;
+
     CollectionCacheType m_checkpointCacheList;
     QuorumRecoderType m_checkpointCacheWeight;
 
-    PBFTTimer::Ptr m_timer;
-
     std::function<void(bcos::protocol::BlockNumber)> m_committedIndexNotifier;
 };
-}  // namespace consensus
-}  // namespace bcos
+}  // namespace bcos::consensus

@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <bcos-framework/protocol/ProtocolInfo.h>
 #include <bcos-gateway/libnetwork/Common.h>
 #include <bcos-gateway/libnetwork/SessionFace.h>
 #include <bcos-gateway/libp2p/Common.h>
@@ -18,7 +19,8 @@ namespace gateway
 class P2PMessage;
 class Service;
 
-class P2PSession : public std::enable_shared_from_this<P2PSession>
+class P2PSession : public std::enable_shared_from_this<P2PSession>,
+                   public bcos::ObjectCounter<P2PSession>
 {
 public:
     using Ptr = std::shared_ptr<P2PSession>;
@@ -29,7 +31,7 @@ public:
 
     virtual void start();
     virtual void stop(DisconnectReason reason);
-    virtual bool actived() { return m_run; }
+    virtual bool active() { return m_run; }
     virtual void heartBeat();
 
     virtual SessionFace::Ptr session() { return m_session; }
@@ -48,6 +50,19 @@ public:
     virtual std::weak_ptr<Service> service() { return m_service; }
     virtual void setService(std::weak_ptr<Service> service) { m_service = service; }
 
+    virtual void setProtocolInfo(bcos::protocol::ProtocolInfo::ConstPtr _protocolInfo)
+    {
+        WriteGuard l(x_protocolInfo);
+        *m_protocolInfo = *_protocolInfo;
+    }
+    // empty when negotiate failed or negotiate unfinished
+    virtual bcos::protocol::ProtocolInfo::ConstPtr protocolInfo() const
+    {
+        // TODO: check if the lock below is necessary?
+        // ReadGuard l(x_protocolInfo);
+        return m_protocolInfo;
+    }
+
 private:
     SessionFace::Ptr m_session;
     /// gateway p2p info
@@ -56,6 +71,9 @@ private:
     std::shared_ptr<boost::asio::deadline_timer> m_timer;
     bool m_run = false;
     const static uint32_t HEARTBEAT_INTERVEL = 5000;
+
+    bcos::protocol::ProtocolInfo::Ptr m_protocolInfo = nullptr;
+    mutable bcos::SharedMutex x_protocolInfo;
 };
 
 }  // namespace gateway

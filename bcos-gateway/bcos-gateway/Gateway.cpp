@@ -18,24 +18,46 @@
  * @date 2021-04-19
  */
 
-#include <bcos-framework/interfaces/protocol/CommonError.h>
+#include "bcos-front/FrontMessage.h"
+#include "bcos-gateway/GatewayConfig.h"
+#include "bcos-gateway/GatewayFactory.h"
+#include "bcos-gateway/gateway/FrontServiceInfo.h"
+#include "bcos-gateway/gateway/GatewayStatus.h"
+#include "bcos-gateway/libnetwork/Session.h"
+#include "bcos-gateway/libnetwork/Socket.h"
+#include "bcos-gateway/libp2p/P2PMessageV2.h"
+#include "bcos-gateway/libp2p/P2PSession.h"
+#include "bcos-gateway/libp2p/Service.h"
+#include "bcos-gateway/libp2p/ServiceV2.h"
+#include "bcos-gateway/protocol/GatewayNodeStatus.h"
+#include "bcos-utilities/BoostLog.h"
+#include "filter/Filter.h"
+#include <bcos-framework/protocol/CommonError.h>
 #include <bcos-gateway/Common.h>
 #include <bcos-gateway/Gateway.h>
+#include <bcos-gateway/gateway/GatewayMessageExtAttributes.h>
+#include <bcos-gateway/libp2p/P2PMessage.h>
 #include <bcos-utilities/Common.h>
 #include <bcos-utilities/Exceptions.h>
 #include <json/json.h>
-#include <boost/core/ignore_unused.hpp>
 #include <algorithm>
 #include <random>
+#include <string>
+#include <vector>
 
 using namespace bcos;
 using namespace bcos::protocol;
 using namespace bcos::gateway;
 using namespace bcos::group;
 using namespace bcos::amop;
+using namespace bcos::crypto;
 
 void Gateway::start()
 {
+    if (m_gatewayRateLimiter)
+    {
+        m_gatewayRateLimiter->start();
+    }
     if (m_p2pInterface)
     {
         m_p2pInterface->start();
@@ -49,32 +71,16 @@ void Gateway::start()
         m_gatewayNodeManager->start();
     }
 
-    const auto& frontServiceInfos = m_gatewayNodeManager->frontServiceInfos();
-    if (frontServiceInfos.empty())
-    {
-        GATEWAY_LOG(WARNING) << LOG_DESC("gateway has no registered front service");
-    }
-    else
-    {
-        for (const auto& group : frontServiceInfos)
-        {
-            for (const auto& node : group.second)
-            {
-                GATEWAY_LOG(INFO) << LOG_DESC("start") << LOG_KV("groupID", group.first)
-                                  << LOG_KV("nodeID", node.first);
-            }
-        }
-    }
-
     GATEWAY_LOG(INFO) << LOG_DESC("start end.");
-
-    return;
 }
 
 void Gateway::stop()
 {
+    // erase the registered handler
     if (m_p2pInterface)
     {
+        m_p2pInterface->eraseHandlerByMsgType(GatewayMessageType::PeerToPeerMessage);
+        m_p2pInterface->eraseHandlerByMsgType(GatewayMessageType::BroadcastMessage);
         m_p2pInterface->stop();
     }
     if (m_amop)
@@ -85,39 +91,12 @@ void Gateway::stop()
     {
         m_gatewayNodeManager->stop();
     }
+    if (m_gatewayRateLimiter)
+    {
+        m_gatewayRateLimiter->stop();
+    }
+
     GATEWAY_LOG(INFO) << LOG_DESC("stop end.");
-    return;
-}
-
-std::shared_ptr<P2PMessage> Gateway::newP2PMessage(const std::string& _groupID,
-    bcos::crypto::NodeIDPtr _srcNodeID, bcos::crypto::NodeIDPtr _dstNodeID, bytesConstRef _payload)
-{
-    auto message =
-        std::static_pointer_cast<P2PMessage>(m_p2pInterface->messageFactory()->buildMessage());
-
-    message->setPacketType(MessageType::PeerToPeerMessage);
-    message->setSeq(m_p2pInterface->messageFactory()->newSeq());
-    message->options()->setGroupID(_groupID);
-    message->options()->setSrcNodeID(_srcNodeID->encode());
-    message->options()->dstNodeIDs().push_back(_dstNodeID->encode());
-    message->setPayload(std::make_shared<bytes>(_payload.begin(), _payload.end()));
-
-    return message;
-}
-
-std::shared_ptr<P2PMessage> Gateway::newP2PMessage(
-    const std::string& _groupID, bcos::crypto::NodeIDPtr _srcNodeID, bytesConstRef _payload)
-{
-    auto message =
-        std::static_pointer_cast<P2PMessage>(m_p2pInterface->messageFactory()->buildMessage());
-
-    message->setPacketType(MessageType::BroadcastMessage);
-    message->setSeq(m_p2pInterface->messageFactory()->newSeq());
-    message->options()->setGroupID(_groupID);
-    message->options()->setSrcNodeID(_srcNodeID->encode());
-    message->setPayload(std::make_shared<bytes>(_payload.begin(), _payload.end()));
-
-    return message;
 }
 
 void Gateway::asyncGetPeers(
@@ -128,103 +107,76 @@ void Gateway::asyncGetPeers(
         return;
     }
     auto sessionInfos = m_p2pInterface->sessionInfos();
+    auto peersNodeIDList = m_gatewayNodeManager->peersRouterTable()->getAllPeers();
     GatewayInfosPtr peerGatewayInfos = std::make_shared<GatewayInfos>();
+    // append the peers sessionInfos
     for (auto const& info : sessionInfos)
     {
         auto gatewayInfo = std::make_shared<GatewayInfo>(info);
-        auto nodeIDInfo = m_gatewayNodeManager->nodeIDInfo(info.p2pID);
-        gatewayInfo->setNodeIDInfo(std::move(nodeIDInfo));
+        auto nodeIDList = m_gatewayNodeManager->peersNodeIDList(info.p2pID);
+        gatewayInfo->setNodeIDInfo(std::move(nodeIDList));
+        peerGatewayInfos->emplace_back(gatewayInfo);
+        peersNodeIDList.erase(info.p2pID);
+    }
+    // append peers that are not directly connected to nodeSelf
+    for (auto const& peer : peersNodeIDList)
+    {
+        P2PInfo p2pInfo;
+        p2pInfo.p2pID = peer;
+        auto gatewayInfo = std::make_shared<GatewayInfo>(p2pInfo);
+        auto nodeIDList = m_gatewayNodeManager->peersNodeIDList(peer);
+        gatewayInfo->setNodeIDInfo(std::move(nodeIDList));
         peerGatewayInfos->emplace_back(gatewayInfo);
     }
     auto localP2pInfo = m_p2pInterface->localP2pInfo();
     auto localGatewayInfo = std::make_shared<GatewayInfo>(localP2pInfo);
-    auto loaclNodeIDInfo = m_gatewayNodeManager->getLocalNodeIDInfo();
-    localGatewayInfo->setNodeIDInfo(std::move(loaclNodeIDInfo));
+    auto localNodeInfo = m_gatewayNodeManager->localRouterTable()->nodeListInfo();
+    localGatewayInfo->setNodeIDInfo(std::move(localNodeInfo));
     _onGetPeers(nullptr, localGatewayInfo, peerGatewayInfos);
 }
 
 /**
  * @brief: get nodeIDs from gateway
  * @param _groupID:
- * @param _getNodeIDsFunc: get nodeIDs callback
+ * @param _onGetGroupNodeInfo: get nodeIDs callback
  * @return void
  */
-void Gateway::asyncGetNodeIDs(const std::string& _groupID, GetNodeIDsFunc _getNodeIDsFunc)
+void Gateway::asyncGetGroupNodeInfo(
+    const std::string& _groupID, GetGroupNodeInfoFunc _onGetGroupNodeInfo)
 {
-    std::shared_ptr<crypto::NodeIDs> nodeIDs = std::make_shared<crypto::NodeIDs>();
-    m_gatewayNodeManager->queryNodeIDsByGroupID(_groupID, *nodeIDs);
-    _getNodeIDsFunc(nullptr, nodeIDs);
+    auto groupNodeInfo = m_gatewayNodeManager->getGroupNodeInfoList(_groupID);
+    _onGetGroupNodeInfo(nullptr, groupNodeInfo);
 }
 
-/**
- * @brief: register FrontService
- * @param _groupID: groupID
- * @param _nodeID: nodeID
- * @param _frontServiceInterface: FrontService
- * @return bool
- */
-bool Gateway::registerFrontService(const std::string& _groupID, bcos::crypto::NodeIDPtr _nodeID,
-    bcos::front::FrontServiceInterface::Ptr _frontServiceInterface)
-{
-    return m_gatewayNodeManager->registerFrontService(_groupID, _nodeID, _frontServiceInterface);
-}
-
-/**
- * @brief: unregister FrontService
- * @param _groupID: groupID
- * @param _nodeID: nodeID
- * @return bool
- */
-bool Gateway::unregisterFrontService(const std::string& _groupID, bcos::crypto::NodeIDPtr _nodeID)
-{
-    return m_gatewayNodeManager->unregisterFrontService(_groupID, _nodeID);
-}
-
-
-// send message to the local nodes
-bool Gateway::trySendLocalMessage(const std::string& _groupID, bcos::crypto::NodeIDPtr _srcNodeID,
-    bcos::crypto::NodeIDPtr _dstNodeID, bytesConstRef _payload, ErrorRespFunc _errorRespFunc)
-{
-    auto frontServiceInfo = m_gatewayNodeManager->queryLocalNodes(_groupID, _dstNodeID->hex());
-    if (!frontServiceInfo)
-    {
-        return false;
-    }
-    frontServiceInfo->frontService()->onReceiveMessage(
-        _groupID, _srcNodeID, _payload, [_errorRespFunc](Error::Ptr _error) {
-            if (_errorRespFunc)
-            {
-                _errorRespFunc(_error);
-            }
-        });
-    return true;
-}
 
 /**
  * @brief: send message
  * @param _groupID: groupID
+ * @param _moduleID: moduleID
  * @param _srcNodeID: the sender nodeID
  * @param _dstNodeID: the receiver nodeID
  * @param _payload: message payload
  * @param _errorRespFunc: error func
  * @return void
  */
-void Gateway::asyncSendMessageByNodeID(const std::string& _groupID,
-    bcos::crypto::NodeIDPtr _srcNodeID, bcos::crypto::NodeIDPtr _dstNodeID, bytesConstRef _payload,
+void Gateway::asyncSendMessageByNodeID(const std::string& _groupID, int _moduleID,
+    NodeIDPtr _srcNodeID, NodeIDPtr _dstNodeID, bytesConstRef _payload,
     ErrorRespFunc _errorRespFunc)
 {
-    std::set<P2pID> p2pIDs;
-    if (!m_gatewayNodeManager->queryP2pIDs(_groupID, _dstNodeID->hex(), p2pIDs))
+    auto p2pIDs =
+        m_gatewayNodeManager->peersRouterTable()->queryP2pIDs(_groupID, _dstNodeID->hex());
+    if (p2pIDs.empty())
     {
-        if (trySendLocalMessage(_groupID, _srcNodeID, _dstNodeID, _payload, _errorRespFunc))
+        if (m_gatewayNodeManager->localRouterTable()->sendMessage(
+                _groupID, _srcNodeID, _dstNodeID, _payload, _errorRespFunc))
         {
             return;
         }
-        GATEWAY_LOG(ERROR) << LOG_DESC("could not find a gateway to send this message")
+        GATEWAY_LOG(DEBUG) << LOG_DESC("could not find a gateway to send this message")
                            << LOG_KV("groupID", _groupID) << LOG_KV("srcNodeID", _srcNodeID->hex())
                            << LOG_KV("dstNodeID", _dstNodeID->hex());
 
-        auto errorPtr = std::make_shared<Error>(CommonError::NotFoundFrontServiceSendMsg,
+        auto errorPtr = BCOS_ERROR_PTR(CommonError::NotFoundFrontServiceSendMsg,
             "could not find a gateway to "
             "send this message, groupID:" +
                 _groupID + " ,dstNodeID:" + _dstNodeID->hex());
@@ -235,133 +187,45 @@ void Gateway::asyncSendMessageByNodeID(const std::string& _groupID,
         return;
     }
 
-    class Retry : public std::enable_shared_from_this<Retry>
-    {
-    public:
-        // random choose one p2pID to send message
-        P2pID randomChooseP2pID()
-        {
-            auto p2pId = P2pID();
-            if (!m_p2pIDs.empty())
-            {
-                // shuffle
-                std::random_device rd;
-                std::default_random_engine rng(rd());
-                std::shuffle(m_p2pIDs.begin(), m_p2pIDs.end(), rng);
-                p2pId = *m_p2pIDs.begin();
-                m_p2pIDs.erase(m_p2pIDs.begin());
-            }
+    auto message =
+        std::static_pointer_cast<P2PMessage>(m_p2pInterface->messageFactory()->buildMessage());
 
-            return p2pId;
-        }
+    auto msgExtAttr = std::make_shared<GatewayMessageExtAttributes>();
+    msgExtAttr->setGroupID(_groupID);
+    msgExtAttr->setModuleID(_moduleID);
 
-        // send the message with retry
-        void trySendMessage()
-        {
-            if (m_p2pIDs.empty())
-            {
-                GATEWAY_LOG(ERROR)
-                    << LOG_DESC("[Gateway::Retry]") << LOG_DESC("unable to send the message")
-                    << LOG_KV("srcNodeID", m_srcNodeID->hex())
-                    << LOG_KV("dstNodeID", m_dstNodeID->hex())
-                    << LOG_KV("seq", std::to_string(m_p2pMessage->seq()));
+    message->setPacketType(GatewayMessageType::PeerToPeerMessage);
+    message->setSeq(m_p2pInterface->messageFactory()->newSeq());
+    message->setPayload(std::make_shared<bytes>(_payload.begin(), _payload.end()));
+    message->setExtAttributes(msgExtAttr);
 
-                if (m_respFunc)
-                {
-                    auto errorPtr = std::make_shared<Error>(
-                        CommonError::GatewaySendMsgFailed, "unable to send the message");
-                    m_respFunc(errorPtr);
-                }
-                return;
-            }
-            auto p2pID = randomChooseP2pID();
-            auto self = shared_from_this();
-            auto callback = [self, p2pID](NetworkException e, std::shared_ptr<P2PSession> session,
-                                std::shared_ptr<P2PMessage> message) {
-                boost::ignore_unused(session);
-                // network error
-                if (e.errorCode() != P2PExceptionType::Success)
-                {
-                    GATEWAY_LOG(DEBUG)
-                        << LOG_BADGE("Retry") << LOG_DESC("network callback")
-                        << LOG_KV("p2pid", p2pID) << LOG_KV("errorCode", e.errorCode())
-                        << LOG_KV("errorMessage", e.what());
-                    // try again
-                    self->trySendMessage();
-                    return;
-                }
+    auto options = message->options();
+    options->setGroupID(_groupID);
+    options->setModuleID(_moduleID);
+    options->setSrcNodeID(_srcNodeID->encode());
+    options->dstNodeIDs().push_back(_dstNodeID->encode());
 
-                try
-                {
-                    auto payload = message->payload();
-                    int respCode =
-                        boost::lexical_cast<int>(std::string(payload->begin(), payload->end()));
-                    // the peer gateway not response not ok ,it means the gateway not dispatch the
-                    // message successfully,find another gateway and try again
-                    if (respCode != CommonError::SUCCESS)
-                    {
-                        GATEWAY_LOG(DEBUG)
-                            << LOG_BADGE("Retry") << LOG_KV("p2pid", p2pID)
-                            << LOG_KV("errorCode", respCode) << LOG_KV("errorMessage", e.what());
-                        // try again
-                        self->trySendMessage();
-                        return;
-                    }
-
-                    GATEWAY_LOG(TRACE) << LOG_BADGE("Retry") << LOG_KV("p2pid", p2pID)
-                                       << LOG_KV("srcNodeID", self->m_srcNodeID->hex())
-                                       << LOG_KV("dstNodeID", self->m_dstNodeID->hex());
-                    // send message successfully
-                    if (self->m_respFunc)
-                    {
-                        self->m_respFunc(nullptr);
-                    }
-                    return;
-                }
-                catch (const std::exception& e)
-                {
-                    GATEWAY_LOG(ERROR) << LOG_BADGE("Retry") << LOG_KV("error", e.what());
-                    self->trySendMessage();
-                }
-            };
-
-            m_p2pInterface->asyncSendMessageByNodeID(p2pID, m_p2pMessage, callback, Options(10000));
-        }
-
-    public:
-        std::vector<P2pID> m_p2pIDs;
-        bcos::crypto::NodeIDPtr m_srcNodeID;
-        bcos::crypto::NodeIDPtr m_dstNodeID;
-        std::shared_ptr<P2PMessage> m_p2pMessage;
-        std::shared_ptr<P2PInterface> m_p2pInterface;
-        ErrorRespFunc m_respFunc;
-    };
-
-    auto retry = std::make_shared<Retry>();
-    retry->m_p2pMessage = newP2PMessage(_groupID, _srcNodeID, _dstNodeID, _payload);
-    retry->m_p2pIDs.insert(retry->m_p2pIDs.begin(), p2pIDs.begin(), p2pIDs.end());
-    retry->m_respFunc = _errorRespFunc;
-    retry->m_srcNodeID = _srcNodeID;
-    retry->m_dstNodeID = _dstNodeID;
-    retry->m_p2pInterface = m_p2pInterface;
+    auto retry = std::make_shared<Retry>(std::move(_srcNodeID), std::move(_dstNodeID),
+        std::move(message), m_p2pInterface, std::move(_errorRespFunc), _moduleID);
+    retry->insertP2pIDs(p2pIDs);
     retry->trySendMessage();
 }
 
 /**
  * @brief: send message to multiple nodes
  * @param _groupID: groupID
+ * @param _moduleID: moduleID
  * @param _srcNodeID: the sender nodeID
  * @param _nodeIDs: the receiver nodeIDs
  * @param _payload: message content
  * @return void
  */
-void Gateway::asyncSendMessageByNodeIDs(const std::string& _groupID,
-    bcos::crypto::NodeIDPtr _srcNodeID, const bcos::crypto::NodeIDs& _dstNodeIDs,
-    bytesConstRef _payload)
+void Gateway::asyncSendMessageByNodeIDs(const std::string& _groupID, int _moduleID,
+    NodeIDPtr _srcNodeID, const NodeIDs& _dstNodeIDs, bytesConstRef _payload)
 {
     for (auto dstNodeID : _dstNodeIDs)
     {
-        asyncSendMessageByNodeID(_groupID, _srcNodeID, dstNodeID, _payload,
+        asyncSendMessageByNodeID(_groupID, _moduleID, _srcNodeID, dstNodeID, _payload,
             [_groupID, _srcNodeID, dstNodeID](Error::Ptr _error) {
                 if (!_error)
                 {
@@ -375,65 +239,40 @@ void Gateway::asyncSendMessageByNodeIDs(const std::string& _groupID,
     }
 }
 
-
-bool Gateway::asyncBroadcastMessageToLocalNodes(
-    const std::string& _groupID, bcos::crypto::NodeIDPtr _srcNodeID, bytesConstRef _payload)
-{
-    auto frontServiceInfos = m_gatewayNodeManager->groupFrontServices(_groupID);
-    if (frontServiceInfos.size() == 0)
-    {
-        return false;
-    }
-    for (auto const& it : frontServiceInfos)
-    {
-        auto frontService = it.second->frontService();
-        auto dstNodeID = it.first;
-        frontService->onReceiveMessage(
-            _groupID, _srcNodeID, _payload, [_srcNodeID, dstNodeID](Error::Ptr _error) {
-                if (_error)
-                {
-                    GATEWAY_LOG(ERROR)
-                        << LOG_DESC("asyncBroadcastMessageToLocalNodes error")
-                        << LOG_KV("src", _srcNodeID->hex()) << LOG_KV("dst", dstNodeID)
-                        << LOG_KV("code", _error->errorCode())
-                        << LOG_KV("msg", _error->errorMessage());
-                }
-            });
-    }
-    return true;
-}
 /**
  * @brief: send message to all nodes
  * @param _groupID: groupID
+ * @param _moduleID: moduleID
  * @param _srcNodeID: the sender nodeID
  * @param _payload: message content
  * @return void
  */
-void Gateway::asyncSendBroadcastMessage(
-    const std::string& _groupID, bcos::crypto::NodeIDPtr _srcNodeID, bytesConstRef _payload)
+void Gateway::asyncSendBroadcastMessage(uint16_t _type, const std::string& _groupID, int _moduleID,
+    NodeIDPtr _srcNodeID, bytesConstRef _payload)
 {
-    std::set<P2pID> p2pIDs;
-    auto ret = asyncBroadcastMessageToLocalNodes(_groupID, _srcNodeID, _payload);
-    if (!m_gatewayNodeManager->queryP2pIDsByGroupID(_groupID, p2pIDs))
-    {
-        if (!ret)
-        {
-            GATEWAY_LOG(ERROR) << LOG_DESC(
-                                      "could not find a gateway "
-                                      "to send this broadcast message")
-                               << LOG_KV("groupID", _groupID)
-                               << LOG_KV("srcNodeID", _srcNodeID->hex());
-        }
-        return;
-    }
+    // broadcast message to the local nodes
+    auto ret = m_gatewayNodeManager->localRouterTable()->asyncBroadcastMsg(
+        _type, _groupID, _moduleID, _srcNodeID, _payload);
+    auto message =
+        std::static_pointer_cast<P2PMessage>(m_p2pInterface->messageFactory()->buildMessage());
+    message->setPacketType(GatewayMessageType::BroadcastMessage);
+    message->setExt(_type);
+    message->setSeq(m_p2pInterface->messageFactory()->newSeq());
+    message->setPayload(std::make_shared<bytes>(_payload.begin(), _payload.end()));
 
-    auto p2pMessage = newP2PMessage(_groupID, _srcNodeID, _payload);
-    for (const P2pID& p2pID : p2pIDs)
-    {
-        m_p2pInterface->asyncSendMessageByNodeID(p2pID, p2pMessage, CallbackFuncWithSession());
-    }
+    auto options = message->options();
+    options->setGroupID(_groupID);
+    options->setSrcNodeID(_srcNodeID->encode());
+    options->setModuleID(_moduleID);
 
-    GATEWAY_LOG(TRACE) << "asyncSendBroadcastMessage send message" << LOG_KV("groupID", _groupID);
+    auto msgExtAttr = std::make_shared<GatewayMessageExtAttributes>();
+    msgExtAttr->setGroupID(_groupID);
+    msgExtAttr->setModuleID(_moduleID);
+    message->setExtAttributes(msgExtAttr);
+
+    // broadcast message to the peers
+    m_gatewayNodeManager->peersRouterTable()->asyncBroadcastMsg(
+        _type, _groupID, _moduleID, message);
 }
 
 /**
@@ -445,12 +284,12 @@ void Gateway::asyncSendBroadcastMessage(
  * @param _callback: callback
  * @return void
  */
-void Gateway::onReceiveP2PMessage(const std::string& _groupID, bcos::crypto::NodeIDPtr _srcNodeID,
-    bcos::crypto::NodeIDPtr _dstNodeID, bytesConstRef _payload, ErrorRespFunc _errorRespFunc)
+void Gateway::onReceiveP2PMessage(const std::string& _groupID, NodeIDPtr _srcNodeID,
+    NodeIDPtr _dstNodeID, bytesConstRef _payload, ErrorRespFunc _errorRespFunc)
 {
-    bcos::front::FrontServiceInterface::Ptr frontServiceInterface =
-        m_gatewayNodeManager->queryFrontServiceInterfaceByGroupIDAndNodeID(_groupID, _dstNodeID);
-    if (!frontServiceInterface)
+    auto frontService =
+        m_gatewayNodeManager->localRouterTable()->getFrontService(_groupID, _dstNodeID);
+    if (!frontService)
     {
         GATEWAY_LOG(ERROR) << LOG_DESC(
                                   "onReceiveP2PMessage unable to find front "
@@ -458,7 +297,7 @@ void Gateway::onReceiveP2PMessage(const std::string& _groupID, bcos::crypto::Nod
                            << LOG_KV("groupID", _groupID) << LOG_KV("srcNodeID", _srcNodeID->hex())
                            << LOG_KV("dstNodeID", _dstNodeID->hex());
 
-        auto errorPtr = std::make_shared<Error>(CommonError::NotFoundFrontServiceDispatchMsg,
+        auto errorPtr = BCOS_ERROR_PTR(CommonError::NotFoundFrontServiceDispatchMsg,
             "unable to find front service dispatch message to "
             "groupID:" +
                 _groupID + " ,nodeID:" + _dstNodeID->hex());
@@ -470,7 +309,7 @@ void Gateway::onReceiveP2PMessage(const std::string& _groupID, bcos::crypto::Nod
         return;
     }
 
-    frontServiceInterface->onReceiveMessage(_groupID, _srcNodeID, _payload,
+    frontService->frontService()->onReceiveMessage(_groupID, _srcNodeID, _payload,
         [_groupID, _srcNodeID, _dstNodeID, _errorRespFunc](Error::Ptr _error) {
             if (_errorRespFunc)
             {
@@ -485,37 +324,199 @@ void Gateway::onReceiveP2PMessage(const std::string& _groupID, bcos::crypto::Nod
         });
 }
 
-/**
- * @brief: receive group broadcast message
- * @param _groupID: groupID
- * @param _srcNodeID: the sender nodeID
- * @param _payload: message payload
- * @return void
- */
-void Gateway::onReceiveBroadcastMessage(
-    const std::string& _groupID, bcos::crypto::NodeIDPtr _srcNodeID, bytesConstRef _payload)
+bool Gateway::checkGroupInfo(bcos::group::GroupInfo::Ptr _groupInfo)
 {
-    auto frontServiceInterfaces =
-        m_gatewayNodeManager->queryFrontServiceInterfaceByGroupID(_groupID);
-    for (const auto& frontServiceInterface : frontServiceInterfaces)
+    // check the serviceName
+    auto nodeList = _groupInfo->nodeInfos();
+    for (auto const& node : nodeList)
     {
-        frontServiceInterface->onReceiveMessage(
-            _groupID, _srcNodeID, _payload, [_groupID, _srcNodeID](Error::Ptr _error) {
-                GATEWAY_LOG(TRACE)
-                    << LOG_DESC("onReceiveBroadcastMessage callback") << LOG_KV("groupID", _groupID)
-                    << LOG_KV("srcNodeID", _srcNodeID->hex())
-                    << LOG_KV("code", (_error ? _error->errorCode() : 0))
-                    << LOG_KV("msg", (_error ? _error->errorMessage() : ""));
-            });
+        auto const& expectedGatewayService =
+            node.second->serviceName(bcos::protocol::ServiceType::GATEWAY);
+        if (expectedGatewayService != m_gatewayServiceName)
+        {
+            GATEWAY_LOG(INFO) << LOG_DESC(
+                                     "unfollowed groupInfo for inconsistent gateway service name")
+                              << LOG_KV("expected", expectedGatewayService)
+                              << LOG_KV("selfName", m_gatewayServiceName);
+            return false;
+        }
     }
+    return true;
 }
 
 void Gateway::asyncNotifyGroupInfo(
     bcos::group::GroupInfo::Ptr _groupInfo, std::function<void(Error::Ptr&&)> _callback)
 {
+    if (!checkGroupInfo(_groupInfo))
+    {
+        if (_callback)
+        {
+            _callback(nullptr);
+        }
+        return;
+    }
     m_gatewayNodeManager->updateFrontServiceInfo(_groupInfo);
     if (_callback)
     {
         _callback(nullptr);
     }
+}
+
+void Gateway::onReceiveP2PMessage(
+    NetworkException const& _e, P2PSession::Ptr _session, std::shared_ptr<P2PMessage> _msg)
+{
+    if (_e.errorCode())
+    {
+        GATEWAY_LOG(WARNING) << LOG_DESC("onReceiveP2PMessage error")
+                             << LOG_KV("code", _e.errorCode()) << LOG_KV("msg", _e.what());
+        return;
+    }
+
+    auto options = _msg->options();
+    auto msgPayload = _msg->payload();
+    auto payload = bytesConstRef(msgPayload->data(), msgPayload->size());
+    // groupID
+    auto groupID = options->groupID();
+    // moduleID
+    auto moduleID = options->moduleID();
+
+
+    // Notice: moduleID not set the previous version, try to decode from front message
+    if (moduleID == 0)
+    {
+        moduleID = front::FrontMessage::tryDecodeModuleID(payload);
+    }
+
+    if (moduleID == 0)
+    {
+        GATEWAY_LOG(TRACE) << LOG_BADGE("onReceiveP2PMessage")
+                           << LOG_DESC("front message module id not found")
+                           << LOG_KV("groupID", groupID) << LOG_KV("moduleID", moduleID)
+                           << LOG_KV("seq", _msg->seq()) << LOG_KV("payload size", payload.size());
+    }
+
+    // Readonly filter
+    if (m_readonlyFilter && !filter(*m_readonlyFilter, groupID, moduleID, {}))
+    {
+        GATEWAY_LOG(WARNING) << "P2PMessage moduleID: " << moduleID << " filter by readOnlyFilter";
+
+        // Drop the message
+        return;
+    }
+
+    if (m_gatewayRateLimiter)
+    {
+        // The moduleID is not obtained,
+        auto result = ((moduleID == 0) ?
+                           std::nullopt :
+                           m_gatewayRateLimiter->checkInComing(groupID, moduleID, _msg->length()));
+        if (result.has_value())
+        {
+            auto errorCode = std::to_string((int)protocol::CommonError::GatewayQPSOverFlow);
+            m_p2pInterface->sendRespMessageBySession(
+                bytesConstRef((byte*)errorCode.data(), errorCode.size()), _msg, _session);
+            return;
+        }
+    }
+
+    auto srcNodeID = options->srcNodeID();
+    const auto& dstNodeIDs = options->dstNodeIDs();
+    auto srcNodeIDPtr = m_gatewayNodeManager->keyFactory()->createKey(*srcNodeID);
+    auto dstNodeIDPtr = m_gatewayNodeManager->keyFactory()->createKey(*dstNodeIDs[0]);
+    auto gateway = std::weak_ptr<Gateway>(shared_from_this());
+    onReceiveP2PMessage(groupID, srcNodeIDPtr, dstNodeIDPtr, payload,
+        [groupID, moduleID, srcNodeIDPtr, dstNodeIDPtr, _session, _msg, gateway](
+            Error::Ptr _error) {
+            auto gatewayPtr = gateway.lock();
+            if (!gatewayPtr)
+            {
+                return;
+            }
+
+            auto errorCode =
+                std::to_string(_error ? _error->errorCode() : (int)protocol::CommonError::SUCCESS);
+            if (_error)
+            {
+                GATEWAY_LOG(TRACE)
+                    << LOG_BADGE("onReceiveP2PMessage") << "callback failed"
+                    << LOG_KV("code", _error->errorCode())
+                    << LOG_KV("message", _error->errorMessage()) << LOG_KV("group", groupID)
+                    << LOG_KV("moduleID", moduleID) << LOG_KV("src", srcNodeIDPtr->shortHex())
+                    << LOG_KV("dst", dstNodeIDPtr->shortHex());
+            }
+            gatewayPtr->m_p2pInterface->sendRespMessageBySession(
+                bytesConstRef((byte*)errorCode.data(), errorCode.size()), _msg, _session);
+        });
+}
+
+void Gateway::onReceiveBroadcastMessage(
+    NetworkException const& _e, P2PSession::Ptr _session, std::shared_ptr<P2PMessage> _msg)
+{
+    if (_e.errorCode() != 0)
+    {
+        GATEWAY_LOG(WARNING) << LOG_DESC("onReceiveBroadcastMessage failed")
+                             << LOG_KV("code", _e.errorCode()) << LOG_KV("msg", _e.what());
+        return;
+    }
+
+    auto options = _msg->options();
+    auto payload = _msg->payload();
+
+    // groupID
+    auto groupID = options->groupID();
+    // moduleID
+    uint16_t moduleID = options->moduleID();
+
+
+    // Notice: moduleID not set the previous version, try to decode from front message
+    if (moduleID == 0)
+    {
+        moduleID =
+            front::FrontMessage::tryDecodeModuleID(bytesConstRef(payload->data(), payload->size()));
+    }
+
+    if (moduleID == 0)
+    {
+        GATEWAY_LOG(TRACE) << LOG_BADGE("onReceiveBroadcastMessage")
+                           << LOG_DESC("front message module id not found")
+                           << LOG_KV("groupID", groupID) << LOG_KV("moduleID", moduleID)
+                           << LOG_KV("seq", _msg->seq()) << LOG_KV("payload size", payload->size());
+    }
+
+    // Readonly filter
+    if (m_readonlyFilter && !filter(*m_readonlyFilter, groupID, moduleID, bytesConstRef{}))
+    {
+        GATEWAY_LOG(WARNING) << "BroadcastMessage moduleID: " << moduleID
+                             << " filter by readOnlyFilter";
+        return;
+    }
+
+    if (m_gatewayRateLimiter)
+    {
+        auto result = ((moduleID == 0) ?
+                           std::nullopt :
+                           m_gatewayRateLimiter->checkInComing(groupID, moduleID, _msg->length()));
+        if (result.has_value())
+        {
+            auto result = m_gatewayRateLimiter->checkInComing(groupID, moduleID, _msg->length());
+
+            if (result)
+            {
+                // For broadcast message, ratelimit check failed, do nothing.
+                return;
+            }
+        }
+    }
+
+    auto srcNodeIDPtr =
+        m_gatewayNodeManager->keyFactory()->createKey(*(_msg->options()->srcNodeID()));
+
+    auto type = _msg->ext();
+    m_gatewayNodeManager->localRouterTable()->asyncBroadcastMsg(type, groupID, moduleID,
+        srcNodeIDPtr, bytesConstRef(_msg->payload()->data(), _msg->payload()->size()));
+}
+
+void bcos::gateway::Gateway::enableReadOnlyMode()
+{
+    m_readonlyFilter.emplace();
 }

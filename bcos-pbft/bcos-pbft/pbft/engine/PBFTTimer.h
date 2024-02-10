@@ -20,17 +20,19 @@
  */
 #pragma once
 #include <bcos-utilities/Timer.h>
-namespace bcos
-{
-namespace consensus
+namespace bcos::consensus
 {
 class PBFTTimer : public Timer
 {
 public:
     using Ptr = std::shared_ptr<PBFTTimer>;
-    explicit PBFTTimer(uint64_t _timeout) : Timer(_timeout) { updateAdjustedTimeout(); }
+    explicit PBFTTimer(uint64_t _timeout, std::string const& _name = "pbftTimer")
+      : Timer(_timeout, _name)
+    {
+        updateAdjustedTimeout();
+    }
 
-    ~PBFTTimer() override {}
+    ~PBFTTimer() override = default;
 
     void updateChangeCycle(uint64_t _changeCycle)
     {
@@ -75,5 +77,4 @@ private:
     double const m_base = 1.5;
     uint64_t c_maxChangeCycle = 10;
 };
-}  // namespace consensus
-}  // namespace bcos
+}  // namespace bcos::consensus

@@ -18,7 +18,7 @@
  * @date 2021-04-20
  */
 
-#include <bcos-front/FrontMessage.h>
+#include "FrontMessage.h"
 #include <boost/asio.hpp>
 
 using namespace bcos;
@@ -86,4 +86,14 @@ ssize_t FrontMessage::decode(bytesConstRef _buffer)
     m_payload = _buffer.getCroppedData(offset);
 
     return MessageDecodeStatus::MESSAGE_COMPLETE;
+}
+
+uint16_t FrontMessage::tryDecodeModuleID(bytesConstRef _buffer)
+{
+    if (_buffer.size() < sizeof(uint16_t))
+    {
+        return 0;
+    }
+
+    return boost::asio::detail::socket_ops::network_to_host_short(*((uint16_t*)&_buffer[0]));
 }
